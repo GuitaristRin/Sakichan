@@ -1,0 +1,17 @@
+﻿# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Saki-chan 内部文件
+.sakichan/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
