@@ -19,10 +19,12 @@ Sakichan is a Rust CLI that wraps a local Ollama instance into a five-phase AI c
 
 ### Two models, fixed roles
 
-| Constant | Value | Used for |
-|---|---|---|
-| `DSR1` | `deepseek-r1:8b` | Phase 1 analysis, Phase 3 planning, architect check (4c/4d), compile fix (4e) |
-| `QWEN` | `qwen2.5-coder:7b` | Phase 0 context extraction, Phase 4 review (4b), default code generation |
+| Constant | Role | Value | Responsibility |
+|---|---|---|---|
+| `DSR1` | Engineer & Architect | `deepseek-r1:8b` | Analysis (Phase 1), planning (Phase 3), architect check (4c/4d), compile fix (4e), doc writing |
+| `QWEN` | Programmer | `qwen2.5-coder:7b` | Context extraction (Phase 0), code generation (Phase 4a QWEN steps), code review (4b) |
+
+Role constants: `ROLE_DSR1` and `ROLE_QWEN` are prepended to each model's prompts to enforce role identity.
 
 Each plan step carries an `assigned_model` field (`"QWEN"` or `"DSR1"`); `resolve_model()` maps this string to the actual model constant. The user's `state.current_model` field is stored but does not affect which model runs — model selection is fully driven by the plan.
 
@@ -40,7 +42,8 @@ Three named presets tune inference per use-case:
 
 ```
 Phase 0  gather_context()   – qwen extracts filenames from request, reads them, enriches prompt
-Phase 1  Analysis           – DSR1 returns JSON: understanding, task_type (free-form), complexity 1-10,
+Phase 1  Analysis           – DSR1 returns JSON: understanding, task_type (free-form), task_category
+                               (new_project|modify_project|document|analysis|other), complexity 1-10,
                                gathered_info[], clarifications[]
 Phase 2  Clarification      – shows gathered_info; up to 3 inline questions; extras auto-answered
 Phase 3  Planning           – DSR1 produces steps[]: id, name, submodule_prompt, assigned_model,
@@ -64,7 +67,7 @@ Phase 4 suppresses `cargo check` failure output — errors go silently back into
 
 ### Key invariants
 
-- **Read-only by default.** `state.edit_mode = false` at startup; Phase 4 file writes are skipped unless the user runs `/edit`.
+- **Confirmation gate.** After Phase 3 (plan displayed), Sakichan always asks `[y/n/a]` before Phase 4 unless `edit_mode=true`. `y` = execute once; `n` = cancel; `a` = set `edit_mode=true` (equivalent to `/edit`, no further prompts). `/edit` command toggles `edit_mode` persistently for the session.
 - **Compilation gate.** Each compile attempt only proceeds if `cargo check` passes; on failure, the error text (≤1500 chars) is appended to the prompt and retried.
 - **Executor safety.** `src/executor.rs` blocks dangerous command strings (`rm -rf /`, `diskpart`, etc.) before spawning any shell.
 - **Environment header.** Every AI prompt starts with a Windows 11 / PowerShell environment declaration, even though the host is Linux — this is intentional for the *target* environment the generated code runs in.

@@ -30,8 +30,8 @@ pub fn get_i18n() -> HashMap<String, HashMap<String, String>> {
     zh.insert("build_done".into(), "🎉 构建完成！".into());
     zh.insert("log_updated".into(), "📝 日志已更新".into());
     zh.insert("rules_updated".into(), "📄 规则文件已更新".into());
-    zh.insert("edit_on".into(), "✏️  编辑模式已开启".into());
-    zh.insert("edit_off".into(), "🔒 编辑模式已关闭".into());
+    zh.insert("edit_on".into(), "✏️  始终执行模式已开启（执行前不再询问确认）".into());
+    zh.insert("edit_off".into(), "🔒 已关闭：每次执行前会询问确认".into());
     zh.insert("unknown_cmd".into(), "未知命令，输入 /help 查看帮助".into());
     map.insert("zh_TW".into(), zh);
 
@@ -55,8 +55,8 @@ pub fn get_i18n() -> HashMap<String, HashMap<String, String>> {
     en.insert("build_done".into(), "🎉 Build complete!".into());
     en.insert("log_updated".into(), "📝 Log updated".into());
     en.insert("rules_updated".into(), "📄 Rules file updated".into());
-    en.insert("edit_on".into(), "✏️  Edit mode enabled".into());
-    en.insert("edit_off".into(), "🔒 Edit mode disabled".into());
+    en.insert("edit_on".into(), "✏️  Always-execute enabled (no confirmation prompt)".into());
+    en.insert("edit_off".into(), "🔒 Disabled: will ask for confirmation before each run".into());
     en.insert("unknown_cmd".into(), "Unknown command, type /help for help".into());
     map.insert("en".into(), en);
 
@@ -99,7 +99,7 @@ pub fn handle_command(
                 ("/sessions", "列出历史会话 / List sessions"),
                 ("/resume <id>", "恢复会话 / Resume session"),
                 ("/export <id>", "导出会话 / Export session"),
-                ("/edit", "切换编辑模式 / Toggle edit mode"),
+                ("/edit", "切换始终执行模式 / Toggle always-execute (skip confirm)"),
                 ("/lang <zh|en>", "切换语言 / Switch language"),
                 ("/undo [n]", "回滚 git checkpoint / Rollback checkpoint(s)"),
                 ("/history", "显示 sakichan 提交历史 / Show sakichan commits"),
