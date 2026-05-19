@@ -26,10 +26,22 @@ struct AnalysisResponse {
     #[serde(default = "default_code_mod")]
     code_modification: bool,
     #[serde(default)]
+    gathered_info: Vec<GatheredInfo>,
+    #[serde(default)]
     clarifications: Vec<Clarification>,
 }
 
 fn default_code_mod() -> bool { true }
+
+#[derive(Debug, Deserialize, Default)]
+struct GatheredInfo {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    source: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct Clarification {
@@ -222,6 +234,51 @@ fn get_output_language(state: &Arc<Mutex<AppState>>) -> String {
     else { "English".to_string() }
 }
 
+fn gather_context(
+    ollama: &OllamaClient,
+    user_request: &str,
+    files_str: &str,
+    work_dir: &Path,
+) -> String {
+    const FILE_EXTS: &[&str] = &[".md", ".rs", ".toml", ".txt", ".json", ".yaml", ".yml", ".py", ".js", ".ts", ".lock"];
+    if !FILE_EXTS.iter().any(|ext| user_request.contains(ext)) {
+        return user_request.to_string();
+    }
+
+    let prompt = format!(
+        "Extract file names/paths explicitly mentioned in this user request. Return ONLY a JSON array of strings. If none, return [].\n\nUser request: {user_request}\nAvailable files: {files_str}\n\nReturn ONLY like: [\"src/main.rs\", \"Cargo.toml\"]"
+    );
+
+    let Ok((response, _)) = ollama.chat(QWEN, &prompt) else {
+        return user_request.to_string();
+    };
+
+    let files: Vec<String> = response.find('[')
+        .and_then(|s| response[s..].find(']').map(|e| &response[s..s + e + 1]))
+        .and_then(|slice| serde_json::from_str(slice).ok())
+        .unwrap_or_default();
+
+    if files.is_empty() {
+        return user_request.to_string();
+    }
+
+    let mut file_contents = String::new();
+    for filename in &files {
+        let fpath = work_dir.join(filename);
+        if fpath.exists() {
+            if let Ok(content) = fs::read_to_string(&fpath) {
+                file_contents.push_str(&format!("\n=== {filename} ===\n{content}\n"));
+            }
+        }
+    }
+
+    if file_contents.is_empty() {
+        return user_request.to_string();
+    }
+
+    format!("用户需求: {user_request}\n\n相关文件内容:{file_contents}")
+}
+
 pub fn run_orchestrator(
     state: &Arc<Mutex<AppState>>,
     user_request: &str,
@@ -247,12 +304,23 @@ pub fn run_orchestrator(
     let files_str = existing_files.join(", ");
 
     // ══════════════════════════════════════════════════════════════════
+    // Phase 0: Context Gathering
+    // ══════════════════════════════════════════════════════════════════
+    let enriched_request = gather_context(&ollama, user_request, &files_str, &work_dir);
+
+    // ══════════════════════════════════════════════════════════════════
     // Phase 1: Analysis
     // ══════════════════════════════════════════════════════════════════
     println!("{CYAN}🔍 分析需求中... / Analyzing...{RESET}");
 
     let prompt_a = format!(
-        r#"You are an expert software engineer analyzing a user request.
+        r#"## Environment
+- OS: Windows 11
+- Shell: PowerShell
+- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)
+- Path separator: \
+
+You are an expert software engineer analyzing a user request.
 
 IMPORTANT RULES:
 1. If the user says any of these: "不要修改代码", "只输出分析", "只分析不修改", "analyze only", "no modifications", "do not modify", "只讀", "只读" — this is an ANALYSIS-ONLY request. You MUST set "code_modification": false.
@@ -266,19 +334,32 @@ Project rules:
 
 User request: {}
 
+
 Available tools:
 - [TOOL:read_file path="relative/path"]
 - [TOOL:list_files path="dir"]
 
+Based on ALL information gathered (user request, file contents, project rules, existing code),
+identify what is GENUINELY unclear.
+
+Only list clarifications that meet ALL criteria:
+1. Answer significantly changes implementation direction
+2. Cannot be inferred from existing context
+3. Multiple reasonable approaches exist
+
+Do NOT ask about things you can read from files.
+Do NOT ask "what should I focus on" or "any specific requirements".
+If everything is clear, return empty clarifications array.
+
 Respond with ONLY valid JSON:
-{{"understanding": "brief in {}","complexity":5,"code_modification":true,"clarifications":[{{"question":"q","recommendation":"suggestion"}}]}}
-Complexity is 1-10. All explanation text in {}."#,
-        work_dir.display(), files_str, rules, user_request,
-        output_lang, output_lang
+{{"understanding":"brief in {lang}","complexity":5,"code_modification":true,"gathered_info":[{{"label":"目标平台","value":"Windows","source":"环境推断"}}],"clarifications":[{{"question":"q","recommendation":"suggestion"}}]}}
+Complexity is 1-10. All explanation text in {lang}."#,
+        work_dir.display(), files_str, rules, enriched_request,
+        lang = output_lang
     );
 
     let spinner = Spinner::new(SpinnerState::Thinking);
-    let (analysis_raw, usage_a) = ollama.chat(&model, &prompt_a)?;
+    let (analysis_raw, usage_a) = ollama.chat(DSR1, &prompt_a)?;
     spinner.update_tokens(usage_a.input_tokens + usage_a.output_tokens);
     spinner.stop();
     record_usage(state, &usage_a);
@@ -305,16 +386,28 @@ Complexity is 1-10. All explanation text in {}."#,
     // ══════════════════════════════════════════════════════════════════
     // Phase 2: Clarification
     // ══════════════════════════════════════════════════════════════════
+    if !analysis.gathered_info.is_empty() {
+        println!("{CYAN}📋 已获取的信息:{RESET}");
+        for info in &analysis.gathered_info {
+            println!("  {GREEN}✓{RESET} {}: {} {GRAY}({}){RESET}", info.label, info.value, info.source);
+        }
+        println!();
+    }
+
+    const MAX_INLINE_QUESTIONS: usize = 2;
     let mut decisions = Vec::new();
     if !analysis.clarifications.is_empty() {
-        println!("{YELLOW}🤔 需要澄清以下问题 / Clarification needed:{RESET}");
+        let total = analysis.clarifications.len();
         for (i, c) in analysis.clarifications.iter().enumerate() {
-            println!();
-            println!("{YELLOW}{}. {}{RESET}", i + 1, c.question);
-            if !c.recommendation.is_empty() {
-                println!("{GRAY}   推荐方案: {}{RESET}", c.recommendation);
+            if i >= MAX_INLINE_QUESTIONS {
+                let decision = c.recommendation.clone();
+                decisions.push(format!("Q: {} → A: {} (auto)", c.question, decision));
+                continue;
             }
-            print!("{CYAN}   你的决定 / Your choice [Enter=推荐]: {RESET}");
+            println!();
+            print!("{YELLOW}❓ [{}/{}] {} {GRAY}[推荐: {}]{YELLOW}: {RESET}",
+                i + 1, total.min(MAX_INLINE_QUESTIONS),
+                c.question, c.recommendation);
             let _ = io::stdout().flush();
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
@@ -322,6 +415,8 @@ Complexity is 1-10. All explanation text in {}."#,
             let decision = if input.is_empty() { c.recommendation.clone() } else { input.to_string() };
             decisions.push(format!("Q: {} → A: {}", c.question, decision));
         }
+    } else {
+        println!("{GREEN}✅ 信息充分，无需澄清，直接进入规划{RESET}");
     }
 
     // 如果是纯分析模式，输出分析结果后直接返回
@@ -351,7 +446,13 @@ Complexity is 1-10. All explanation text in {}."#,
     let decisions_str = if decisions.is_empty() { "None".to_string() } else { decisions.join("\n") };
 
     let prompt_p = format!(
-        r#"You are planning implementation steps.
+        r#"## Environment
+- OS: Windows 11
+- Shell: PowerShell
+- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)
+- Path separator: \
+
+You are planning implementation steps.
 
 User request: {}
 Understanding: {}
@@ -367,7 +468,7 @@ Respond with ONLY JSON (all explanation text in {}):
     );
 
     let spinner = Spinner::new(SpinnerState::Thinking);
-    let (plan_raw, usage_p) = ollama.chat(&current_model, &prompt_p)?;
+    let (plan_raw, usage_p) = ollama.chat(DSR1, &prompt_p)?;
     spinner.update_tokens(usage_p.input_tokens + usage_p.output_tokens);
     spinner.stop();
     record_usage(state, &usage_p);
@@ -409,7 +510,13 @@ Respond with ONLY JSON (all explanation text in {}):
         let existing_code = gather_existing_code(&work_dir, &step.files_to_create);
 
         let base_prompt = format!(
-            r#"Implement step {step_id} of a software project.
+            r#"## Environment
+- OS: Windows 11
+- Shell: PowerShell
+- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)
+- Path separator: \
+
+Implement step {step_id} of a software project.
 
 Project: {request}
 Step: {name} - {desc}
@@ -464,25 +571,23 @@ Write FULL compilable code. All explanation in {lang}."#,
                 all_completed_files.push(filename.clone());
             }
     
-            let (ok, output, dur) = executor.run("cargo check 2>&1")?;
-            print_cmd_result("cargo check", ok, &output, dur);
-    
+            let (ok, output, _dur) = executor.run("cargo check 2>&1")?;
+
             if ok {
                 println!("{GREEN}✅ 编译通过 (qwen, attempt {attempt}){RESET}");
                 compile_ok = true;
                 break;
             } else {
-                println!("{RED}✗ qwen attempt {attempt}/{QWEN_MAX_RETRIES} 失败{RESET}");
                 let err: String = output.chars().take(1500).collect();
-                prompt_c = format!("COMPILE ERROR:\n```\n{}\n```\n\nFix ALL files. ```rust filename=\"path\" format. All text in {}.\n\n{}", err, output_lang, base_prompt);
+                prompt_c = format!("## Environment\n- OS: Windows 11\n- Shell: PowerShell\n- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)\n- Path separator: \\\n\nCOMPILE ERROR:\n```\n{}\n```\n\nFix ALL files. ```rust filename=\"path\" format. All text in {}.\n\n{}", err, output_lang, base_prompt);
             }
         }
-    
+
         // ── DSR1 fallback (max 10) ──
         if !compile_ok {
             step_model = DSR1.to_string();
             println!("{RED}🔄 qwen 失败，切换到 deepseek-r1 (最多 10 次)...{RESET}");
-            prompt_c = format!("URGENT: Fix ALL compile errors. All text in {}.\n\n{}", output_lang, base_prompt);
+            prompt_c = format!("## Environment\n- OS: Windows 11\n- Shell: PowerShell\n- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)\n- Path separator: \\\n\nURGENT: Fix ALL compile errors. All text in {}.\n\n{}", output_lang, base_prompt);
     
             for attempt in 1..=DSR1_MAX_RETRIES {
                 let spinner = Spinner::new(SpinnerState::FixingDsr1);
@@ -509,17 +614,15 @@ Write FULL compilable code. All explanation in {lang}."#,
                     all_completed_files.push(filename.clone());
                 }
     
-                let (ok, output, dur) = executor.run("cargo check 2>&1")?;
-                print_cmd_result("cargo check", ok, &output, dur);
-    
+                let (ok, output, _dur) = executor.run("cargo check 2>&1")?;
+
                 if ok {
                     println!("{GREEN}✅ 编译通过 (dsr1, attempt {attempt}){RESET}");
                     compile_ok = true;
                     break;
                 } else {
-                    println!("{RED}✗ dsr1 attempt {attempt}/{DSR1_MAX_RETRIES} 失败{RESET}");
                     let err: String = output.chars().take(1500).collect();
-                    prompt_c = format!("COMPILE ERROR:\n```\n{}\n```\n\nFix ALL files. ```rust filename=\"path\" format. All text in {}.\n\n{}", err, output_lang, base_prompt);
+                    prompt_c = format!("## Environment\n- OS: Windows 11\n- Shell: PowerShell\n- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)\n- Path separator: \\\n\nCOMPILE ERROR:\n```\n{}\n```\n\nFix ALL files. ```rust filename=\"path\" format. All text in {}.\n\n{}", err, output_lang, base_prompt);
                 }
             }
         }
@@ -528,7 +631,7 @@ Write FULL compilable code. All explanation in {lang}."#,
         let _ = logger.log_task(&step.name, &step.description, &all_completed_files, compile_ok, &[], &step_model, step_duration);
     
         if !compile_ok {
-            println!("{RED}Step {} 最终失败 (qwen {} + dsr1 {}){RESET}", step.id, QWEN_MAX_RETRIES, DSR1_MAX_RETRIES);
+            println!("{RED}❌ 编译失败 after {} attempts{RESET}", QWEN_MAX_RETRIES + DSR1_MAX_RETRIES);
         }
     }
     
