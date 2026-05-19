@@ -15,10 +15,79 @@ use rules::RulesManager;
 use state::AppState;
 
 use anyhow::Result;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::{ValidationContext, ValidationResult, Validator};
+use rustyline::{CompletionType, Config, Context, Editor, Helper};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+// Fix 8: Slash command completer for rustyline.
+struct CmdHelper {
+    commands: Vec<String>,
+}
+
+impl CmdHelper {
+    fn new() -> Self {
+        CmdHelper {
+            commands: vec![
+                "/help", "/models", "/model", "/clear", "/init", "/load",
+                "/usage", "/sessions", "/resume", "/export", "/edit",
+                "/lang", "/exit", "/undo", "/history", "/diff",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+impl Helper for CmdHelper {}
+
+impl Completer for CmdHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        if line.starts_with('/') {
+            let word = &line[..pos];
+            let candidates: Vec<Pair> = self
+                .commands
+                .iter()
+                .filter(|c| c.starts_with(word))
+                .map(|c| Pair {
+                    display: c.clone(),
+                    replacement: c.clone(),
+                })
+                .collect();
+            Ok((0, candidates))
+        } else {
+            Ok((pos, vec![]))
+        }
+    }
+}
+
+impl Hinter for CmdHelper {
+    type Hint = String;
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
+}
+
+impl Highlighter for CmdHelper {}
+
+impl Validator for CmdHelper {
+    fn validate(&self, _ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
+        Ok(ValidationResult::Valid(None))
+    }
+}
 
 fn main() -> Result<()> {
     let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -50,7 +119,7 @@ fn main() -> Result<()> {
     let state = Arc::new(Mutex::new(AppState::new(work_dir.clone())));
 
     // 5. Print welcome
-    print_welcome("0.2.0", &models);
+    print_welcome("0.2.1", &models);
 
     // 5b. Check git status
     let git_ok = std::process::Command::new("git")
@@ -82,11 +151,15 @@ fn main() -> Result<()> {
     }
     println!();
 
-    // 6. REPL loop
+    // 6. REPL loop with slash command autocomplete (Fix 8)
     let i18n = get_i18n();
     let mut context: Vec<String> = Vec::new();
 
-    let mut rl = DefaultEditor::new()?;
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut rl = Editor::<CmdHelper, DefaultHistory>::with_config(config)?;
+    rl.set_helper(Some(CmdHelper::new()));
 
     let history_file = work_dir.join(".sakichan").join("history.txt");
     let _ = rl.load_history(&history_file);

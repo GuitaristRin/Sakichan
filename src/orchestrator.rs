@@ -1,7 +1,7 @@
 use crate::display::*;
 use crate::executor::Executor;
 use crate::logger::Logger;
-use crate::ollama::{ModelOptions, OllamaClient};
+use crate::ollama::{ModelOptions, OllamaClient, UsageStats};
 use crate::rules::RulesManager;
 use crate::state::AppState;
 use anyhow::Result;
@@ -19,6 +19,9 @@ const DSR1: &str = "deepseek-r1:8b";
 const REVIEW_MAX_ATTEMPTS: usize = 3;
 const ARCH_MAX_ITERATIONS: usize = 2;
 const CARGO_FIX_MAX: usize = 5;
+
+// Fix 3: Generic AI persona prepended to main prompts.
+const ROLE_HEADER: &str = "你是 Saki-chan，一个通用 AI 助手。你的任务是理解用户需求并给出完整的分析和方案。\n你可以处理代码构建、代码分析、文档撰写、学术写作等各种类型的任务。\n请根据需求的性质自行判断如何处理。\n\n";
 
 // ── Model option presets ──────────────────────────────────────────────────────
 
@@ -141,6 +144,52 @@ fn list_files_in(dir: &Path) -> Vec<String> {
     files
 }
 
+// Fix 2: Recursive directory tree builder. Skips target/, .git/,
+// and .sakichan/sandboxes + .sakichan/sessions.
+fn build_tree(dir: &Path, prefix: &str, lines: &mut Vec<String>) {
+    const SKIP: &[&str] = &["target", ".git"];
+    let Ok(read) = fs::read_dir(dir) else { return };
+
+    let parent_name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+    let mut items: Vec<_> = read
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if SKIP.contains(&name.as_str()) { return false; }
+            if parent_name == ".sakichan" && (name == "sandboxes" || name == "sessions") {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    items.sort_by_key(|e| {
+        let is_file = e.path().is_file() as u8;
+        (is_file, e.file_name())
+    });
+
+    for (i, entry) in items.iter().enumerate() {
+        let is_last = i == items.len() - 1;
+        let connector = if is_last { "└── " } else { "├── " };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        lines.push(format!("{}{}{}{}", prefix, connector, name, if is_dir { "/" } else { "" }));
+        if is_dir {
+            let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+            build_tree(&path, &child_prefix, lines);
+        }
+    }
+}
+
+fn generate_project_tree(work_dir: &Path) -> String {
+    let name = work_dir.file_name().unwrap_or_default().to_string_lossy();
+    let mut lines = vec![format!("{}/", name)];
+    build_tree(work_dir, "", &mut lines);
+    lines.join("\n")
+}
+
 fn extract_code_blocks(response: &str) -> Vec<(String, String, String)> {
     let mut results = Vec::new();
     let re1 = regex::Regex::new(
@@ -178,7 +227,6 @@ fn extract_code_blocks(response: &str) -> Vec<(String, String, String)> {
     results
 }
 
-/// Extract the first complete `{…}` block from raw model output.
 fn parse_json_from_response(response: &str) -> Option<String> {
     if let Some(start) = response.find('{') {
         let sub = &response[start..];
@@ -196,7 +244,6 @@ fn parse_json_from_response(response: &str) -> Option<String> {
     None
 }
 
-/// Process [SYSTEM:read_file path="..."] and [SYSTEM:list_files path="..."] tags in AI output.
 fn process_system_calls(response: &str, work_dir: &Path) -> (String, String) {
     let mut tool_results = String::new();
     let mut clean = response.to_string();
@@ -239,10 +286,17 @@ fn process_system_calls(response: &str, work_dir: &Path) -> (String, String) {
     (clean, tool_results)
 }
 
-fn record_usage(state: &Arc<Mutex<AppState>>, usage: &crate::ollama::UsageStats) {
+fn record_usage(state: &Arc<Mutex<AppState>>, usage: &UsageStats) {
     if let Ok(mut st) = state.lock() {
         st.usage.add(usage);
         let _ = st.save_usage();
+    }
+}
+
+// Fix 7: Accumulate tokens into the global counter after each chat call.
+fn add_global_tokens(global_tokens: &Arc<Mutex<u64>>, usage: &UsageStats) {
+    if let Ok(mut t) = global_tokens.lock() {
+        *t += usage.input_tokens + usage.output_tokens;
     }
 }
 
@@ -268,7 +322,6 @@ fn ensure_cargo_toml(work_dir: &Path) {
     }
 }
 
-/// Write code blocks to disk, updating the written_files map and printing diffs.
 fn write_step_files(
     blocks: &[(String, String, String)],
     work_dir: &Path,
@@ -287,7 +340,6 @@ fn write_step_files(
     }
 }
 
-/// Build a formatted string of all written files for context.
 fn build_code_context(written_files: &HashMap<String, String>) -> String {
     if written_files.is_empty() { return "(no files generated yet)".to_string(); }
     let mut result = String::new();
@@ -299,7 +351,6 @@ fn build_code_context(written_files: &HashMap<String, String>) -> String {
     result
 }
 
-/// Fixed git checkpoint using Command directly (avoids shell quoting bugs).
 fn git_checkpoint(work_dir: &Path, description: &str) -> String {
     let _ = Command::new("git")
         .args(["add", "-A"])
@@ -322,6 +373,38 @@ fn git_checkpoint(work_dir: &Path, description: &str) -> String {
             format!("Git: {}", err.lines().next().unwrap_or("error").trim())
         }
         Err(e) => format!("Error: {e}"),
+    }
+}
+
+// Fix 1b: Extract the [ANALYSIS_DOC] section from Phase 1 response.
+fn extract_analysis_doc(response: &str) -> String {
+    response.find("[ANALYSIS_DOC]")
+        .map(|pos| response[pos + "[ANALYSIS_DOC]".len()..].trim().to_string())
+        .unwrap_or_default()
+}
+
+// Fix 5b: Extract [THINK] block content (everything before the first code fence).
+fn extract_think_block(response: &str) -> Option<String> {
+    response.find("[THINK]").map(|start| {
+        let after = &response[start + "[THINK]".len()..];
+        let end = after.find("```").unwrap_or(after.len());
+        after[..end].trim().to_string()
+    }).filter(|s| !s.is_empty())
+}
+
+// Fix 6: Extract content after [RULES_UPDATE] marker.
+fn extract_rules_update(response: &str) -> Option<String> {
+    response.find("[RULES_UPDATE]")
+        .map(|pos| response[pos + "[RULES_UPDATE]".len()..].trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+// Fix 1c: Build the mental model section to inject into downstream prompts.
+fn mental_model_section(analysis_doc: &str) -> String {
+    if analysis_doc.is_empty() {
+        String::new()
+    } else {
+        format!("## 项目心智模型（由 Phase 1 生成，请仔细阅读）\n{}\n\n", analysis_doc)
     }
 }
 
@@ -384,7 +467,8 @@ fn arch_has_issues(arch: &str) -> bool {
     arch.contains("[MINOR]") || arch.contains("[MAJOR]")
 }
 
-fn build_review_prompt(step: &PlanStep, written_files: &HashMap<String, String>) -> String {
+// Fix 1c: review/architect prompts now receive the analysis_doc mental model.
+fn build_review_prompt(step: &PlanStep, written_files: &HashMap<String, String>, analysis_doc: &str) -> String {
     let code_ctx = {
         let mut s = String::new();
         for f in &step.files_to_create {
@@ -396,25 +480,18 @@ fn build_review_prompt(step: &PlanStep, written_files: &HashMap<String, String>)
     };
 
     format!(
-        r#"你是代码审查员。请检查以下代码是否存在问题。
-
-检查清单：
-1. 拼写错误、语法错误、缺少分号/括号等会导致编译失败的问题
-2. 函数签名、类型、模块引用是否正确
-3. 是否实现了子模块 prompt 中规定的所有输入输出
-4. 与接口规范是否一致
-5. 是否有明显的逻辑漏洞（如未处理的 None/Error）
-
-子模块要求：
-{submodule_prompt}
-
-代码：
-{code_ctx}
-
-用 [REVIEW] 开头，逐条列出检查结果。格式：
-[REVIEW] filename
-✓ 检查项描述
-⚠ 发现问题：具体描述"#,
+        "{mental_model}你是代码审查员。请检查以下代码是否存在问题。\n\n\
+检查清单：\n\
+1. 拼写错误、语法错误、缺少分号/括号等会导致编译失败的问题\n\
+2. 函数签名、类型、模块引用是否正确\n\
+3. 是否实现了子模块 prompt 中规定的所有输入输出\n\
+4. 与接口规范是否一致\n\
+5. 是否有明显的逻辑漏洞（如未处理的 None/Error）\n\n\
+子模块要求：\n{submodule_prompt}\n\n\
+代码：\n{code_ctx}\n\n\
+用 [REVIEW] 开头，逐条列出检查结果。格式：\n\
+[REVIEW] filename\n✓ 检查项描述\n⚠ 发现问题：具体描述",
+        mental_model = mental_model_section(analysis_doc),
         submodule_prompt = step.submodule_prompt,
         code_ctx = code_ctx,
     )
@@ -425,56 +502,39 @@ fn build_fix_prompt(
     written_files: &HashMap<String, String>,
     review: &str,
     output_lang: &str,
+    analysis_doc: &str,
 ) -> String {
     let code_ctx = build_code_context(written_files);
     format!(
-        r#"## Environment
-- OS: Windows 11
-- Shell: PowerShell
-
-审查意见如下，请修复所有标记了 ⚠ 的问题。
-
-审查结果：
-{review}
-
-子模块要求：
-{submodule_prompt}
-
-当前代码：
-{code_ctx}
-
-请输出修复后的完整代码，格式：
-```rust filename="path/to/file.rs"
-// full corrected code
-```
-所有注释和说明用 {output_lang}。"#,
+        "{mental_model}## Environment\n- OS: Windows 11\n- Shell: PowerShell\n\n\
+审查意见如下，请修复所有标记了 ⚠ 的问题。\n\n\
+审查结果：\n{review}\n\n\
+子模块要求：\n{submodule_prompt}\n\n\
+当前代码：\n{code_ctx}\n\n\
+请输出修复后的完整代码，格式：\n\
+```rust filename=\"path/to/file.rs\"\n// full corrected code\n```\n\
+所有注释和说明用 {output_lang}。",
+        mental_model = mental_model_section(analysis_doc),
         submodule_prompt = step.submodule_prompt,
     )
 }
 
-fn build_architect_prompt(user_request: &str, plan_summary: &str, all_code: &str) -> String {
+fn build_architect_prompt(user_request: &str, plan_summary: &str, all_code: &str, analysis_doc: &str) -> String {
     format!(
-        r#"你是架构师。请检查以下模块是否组装正确。
-
-原始需求：{user_request}
-
-规划方案：
-{plan_summary}
-
-各模块代码：
-{all_code}
-
-检查：
-1. 各模块间的接口是否匹配（A 的输出类型 = B 的输入类型）
-2. 数据流是否完整（从入口到出口）
-3. 是否有多余模块或缺失模块
-4. 整体是否符合规划
-
-用 [ARCHITECT] 开头，逐条列出。如有问题，标注严重程度：
-- [MINOR] 可追加修正指令修复
-- [MAJOR] 需要重新生成该模块
-
-如果一切正常，输出：[ARCHITECT] ✓ 所有模块接口匹配，架构检查通过。"#
+        "{mental_model}你是架构师。请检查以下模块是否组装正确。\n\n\
+原始需求：{user_request}\n\n\
+规划方案：\n{plan_summary}\n\n\
+各模块代码：\n{all_code}\n\n\
+检查：\n\
+1. 各模块间的接口是否匹配（A 的输出类型 = B 的输入类型）\n\
+2. 数据流是否完整（从入口到出口）\n\
+3. 是否有多余模块或缺失模块\n\
+4. 整体是否符合规划\n\n\
+用 [ARCHITECT] 开头，逐条列出。如有问题，标注严重程度：\n\
+- [MINOR] 可追加修正指令修复\n\
+- [MAJOR] 需要重新生成该模块\n\n\
+如果一切正常，输出：[ARCHITECT] ✓ 所有模块接口匹配，架构检查通过。",
+        mental_model = mental_model_section(analysis_doc),
     )
 }
 
@@ -483,27 +543,18 @@ fn build_rework_prompt(
     arch_feedback: &str,
     all_code: &str,
     output_lang: &str,
+    analysis_doc: &str,
 ) -> String {
     format!(
-        r#"## Environment
-- OS: Windows 11
-- Shell: PowerShell
-
-架构师发现以下问题，请修复所有受影响的代码。
-
-原始需求：{user_request}
-
-架构师意见：
-{arch_feedback}
-
-当前代码：
-{all_code}
-
-对每个需要修改的文件输出完整修复后的代码，格式：
-```rust filename="path/to/file.rs"
-// full corrected code
-```
-所有注释和说明用 {output_lang}。"#
+        "{mental_model}## Environment\n- OS: Windows 11\n- Shell: PowerShell\n\n\
+架构师发现以下问题，请修复所有受影响的代码。\n\n\
+原始需求：{user_request}\n\n\
+架构师意见：\n{arch_feedback}\n\n\
+当前代码：\n{all_code}\n\n\
+对每个需要修改的文件输出完整修复后的代码，格式：\n\
+```rust filename=\"path/to/file.rs\"\n// full corrected code\n```\n\
+所有注释和说明用 {output_lang}。",
+        mental_model = mental_model_section(analysis_doc),
     )
 }
 
@@ -514,7 +565,9 @@ pub fn run_orchestrator(
     user_request: &str,
     context: &mut Vec<String>,
 ) -> Result<()> {
-    let run_start = Instant::now();
+    // Fix 7: Global timer and token counter shared across all spinner instances.
+    let global_tokens = Arc::new(Mutex::new(0u64));
+    let global_start = Arc::new(Instant::now());
 
     let (host, work_dir, edit_mode, output_lang) = {
         let st = state.lock().unwrap();
@@ -540,60 +593,72 @@ pub fn run_orchestrator(
     let existing_files = list_files_in(&work_dir);
     let files_str = existing_files.join(", ");
 
+    // Fix 2: Generate project directory tree for Phase 1 prompt.
+    let project_tree = generate_project_tree(&work_dir);
+
     // ════════════════════════════════════════════════════════════════════
-    // Phase 0: Context Gathering  (qwen, temperature=0.1)
+    // Phase 0: Context Gathering
     // ════════════════════════════════════════════════════════════════════
     let enriched_request = gather_context(&ollama, user_request, &files_str, &work_dir);
 
     // ════════════════════════════════════════════════════════════════════
-    // Phase 1: Analysis  (dsr1, temperature=0.3)
+    // Phase 1: Analysis  (Fixes 1a, 2b, 3a)
     // ════════════════════════════════════════════════════════════════════
     println!("{CYAN}🔍 分析需求中... / Analyzing...{RESET}");
 
     let prompt_a = format!(
-        r#"## Environment
-- OS: Windows 11
-- Shell: PowerShell
-- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)
-- Path separator: \
-
-You are an expert analyzing a user request. Output your analysis in {lang}.
-
-Work directory: {work_dir}
-Existing files: {files_str}
-Project rules:
-{rules}
-
-User request:
-{request}
-
-Available tools (include in response if you need to inspect files):
-- [SYSTEM:read_file path="relative/path"]
-- [SYSTEM:list_files path="dir"]
-
-Based on the request, output ONLY valid JSON:
-{{"understanding":"brief understanding in {lang}","task_type":"natural language description of task type (e.g. '修改现有Rust代码', '生成学术论文', '代码分析解读', '跨语言翻译')","complexity":5,"gathered_info":[{{"label":"目标","value":"...","source":"需求推断"}}],"clarifications":[{{"question":"q","recommendation":"suggestion"}}]}}
-
-Rules:
-- task_type is free-form natural language, NOT an enum
-- complexity is 1-10
-- clarifications must be empty [] if everything is clear; max 3 items
-- Only ask clarifications that GENUINELY change the implementation direction
-- All text in {lang}"#,
-        lang = output_lang,
+        "{role}## Environment\n\
+- OS: Windows 11\n\
+- Shell: PowerShell\n\
+- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)\n\
+- Path separator: \\\n\n\
+## 项目目录结构\n\
+{project_tree}\n\n\
+Work directory: {work_dir}\n\
+Existing files: {files_str}\n\
+Project rules:\n\
+{rules}\n\n\
+User request:\n\
+{request}\n\n\
+Available tools (include in response if you need to inspect files):\n\
+- [SYSTEM:read_file path=\"relative/path\"]\n\
+- [SYSTEM:list_files path=\"dir\"]\n\n\
+Based on the request, output ONLY valid JSON:\n\
+{{\"understanding\":\"brief understanding in {lang}\",\"task_type\":\"natural language description of task type\",\"complexity\":5,\"gathered_info\":[{{\"label\":\"目标\",\"value\":\"...\",\"source\":\"需求推断\"}}],\"clarifications\":[{{\"question\":\"q\",\"recommendation\":\"suggestion\"}}]}}\n\n\
+Rules:\n\
+- task_type is free-form natural language, NOT an enum\n\
+- complexity is 1-10\n\
+- clarifications must be empty [] if everything is clear; max 3 items\n\
+- Only ask clarifications that GENUINELY change the implementation direction\n\
+- All text in {lang}\n\n\
+完成 JSON 输出后，请生成一份完整的项目分析文档（Markdown 格式），用 [ANALYSIS_DOC] 作为起始标记。\n\
+这份文档将作为共享心智模型，注入到后续所有规划和执行步骤中。\n\n\
+文档结构：\n\
+## 项目心智模型\n\
+### 项目概述\n\
+### 目录结构与模块职责\n\
+### 关键依赖与数据流\n\
+### 重要接口与约定\n\
+### 注意事项\n\n\
+请基于已读取的所有文件内容来撰写，确保信息准确完整。",
+        role = ROLE_HEADER,
+        project_tree = project_tree,
         work_dir = work_dir.display(),
+        files_str = files_str,
+        rules = rules,
         request = enriched_request,
+        lang = output_lang,
     );
 
-    let spinner = Spinner::new(SpinnerState::Thinking);
+    let spinner = Spinner::new(SpinnerState::Thinking, Arc::clone(&global_tokens), Arc::clone(&global_start));
     let (analysis_raw, usage_a) = ollama.chat(DSR1, &prompt_a, Some(&dsr1_opts()))?;
-    spinner.update_tokens(usage_a.input_tokens + usage_a.output_tokens);
+    add_global_tokens(&global_tokens, &usage_a);
     spinner.stop();
     record_usage(state, &usage_a);
 
     let (analysis_clean, tool_results_a) = process_system_calls(&analysis_raw, &work_dir);
     let analysis_text = if tool_results_a.is_empty() {
-        analysis_clean
+        analysis_clean.clone()
     } else {
         format!("{analysis_clean}\n{tool_results_a}")
     };
@@ -602,6 +667,9 @@ Rules:
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
 
+    // Fix 1b: Extract the analysis document generated by Phase 1.
+    let analysis_doc = extract_analysis_doc(&analysis_clean);
+
     println!("{CYAN}📊 复杂度 / Complexity: {}/10{RESET}", analysis.complexity);
     if !analysis.task_type.is_empty() {
         println!("{GRAY}任务类型 / Task type: {}{RESET}", analysis.task_type);
@@ -609,9 +677,12 @@ Rules:
     if !analysis.understanding.is_empty() {
         println!("{GRAY}理解: {}{RESET}", analysis.understanding);
     }
+    if !analysis_doc.is_empty() {
+        println!("{GRAY}📝 分析文档已生成 / Analysis doc generated ({} chars){RESET}", analysis_doc.len());
+    }
 
     // ════════════════════════════════════════════════════════════════════
-    // Phase 2: Clarification  (interactive, max 3 questions)
+    // Phase 2: Clarification
     // ════════════════════════════════════════════════════════════════════
     if !analysis.gathered_info.is_empty() {
         println!("{CYAN}📋 已获取的信息:{RESET}");
@@ -659,7 +730,7 @@ Rules:
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // Phase 3: Planning  (dsr1, temperature=0.3)
+    // Phase 3: Planning  (Fixes 1c, 3b, 4a)
     // ════════════════════════════════════════════════════════════════════
     println!();
     println!("{CYAN}📋 规划步骤中... / Planning...{RESET}");
@@ -671,38 +742,41 @@ Rules:
     };
 
     let prompt_p = format!(
-        r#"## Environment
-- OS: Windows 11
-- Shell: PowerShell
-
-You are planning implementation steps. Output in {lang}.
-
-User request: {request}
-Task type: {task_type}
-Understanding: {understanding}
-Decisions made: {decisions}
-Project rules: {rules}
-Existing files: {files_str}
-
-Output ONLY valid JSON with this schema:
-{{"steps":[{{"id":1,"name":"动词开头的步骤名","submodule_prompt":"完整独立prompt，包含：职责、输入接口、输出规范、不负责的范围。执行模型无需其他上下文即可完成工作。","assigned_model":"QWEN","files_to_create":["path/to/file.rs"],"verification":"如何验证"}}]}}
-
-Rules:
-- submodule_prompt MUST be self-contained; orchestrator will prepend project background
-- assigned_model is "QWEN" (for straightforward tasks) or "DSR1" (for complex logic/architecture)
-- step names MUST start with a verb (e.g. "实现 Fibonacci 函数", not "Fibonacci 函数")
-- If task has no code to write (analysis, essay, etc.), steps should create output files
-- All text in {lang}"#,
+        "{role}{mental_model}## Environment\n\
+- OS: Windows 11\n\
+- Shell: PowerShell\n\n\
+## 任务类型\n\
+{task_type}\n\n\
+注意：如果任务类型不是代码构建（如'撰写报告'、'分析代码'、'学术写作'），\n\
+规划时应生成对应的产物（.md 文档、分析报告等），而非 .rs 代码文件。\n\n\
+You are planning implementation steps. Output in {lang}.\n\n\
+User request: {request}\n\
+Understanding: {understanding}\n\
+Decisions made: {decisions}\n\
+Project rules: {rules}\n\
+Existing files: {files_str}\n\n\
+Output ONLY valid JSON with this schema:\n\
+{{\"steps\":[{{\"id\":1,\"name\":\"动词开头的步骤名\",\"submodule_prompt\":\"完整独立prompt，包含：职责、输入接口、输出规范、不负责的范围。执行模型无需其他上下文即可完成工作。\",\"assigned_model\":\"QWEN\",\"files_to_create\":[\"path/to/file.rs\"],\"verification\":\"如何验证\"}}]}}\n\n\
+Rules:\n\
+- submodule_prompt MUST be self-contained; orchestrator will prepend project background\n\
+- assigned_model is \"QWEN\" (for straightforward tasks) or \"DSR1\" (for complex logic/architecture)\n\
+- step names MUST start with a verb (e.g. \"实现 Fibonacci 函数\", not \"Fibonacci 函数\")\n\
+- If task has no code to write (analysis, essay, etc.), steps should create output files\n\
+- All text in {lang}",
+        role = ROLE_HEADER,
+        mental_model = mental_model_section(&analysis_doc),
+        task_type = analysis.task_type,
         lang = output_lang,
         request = user_request,
-        task_type = analysis.task_type,
         understanding = analysis.understanding,
         decisions = decisions_str,
+        rules = rules,
+        files_str = files_str,
     );
 
-    let spinner = Spinner::new(SpinnerState::Thinking);
+    let spinner = Spinner::new(SpinnerState::Thinking, Arc::clone(&global_tokens), Arc::clone(&global_start));
     let (plan_raw, usage_p) = ollama.chat(DSR1, &prompt_p, Some(&dsr1_opts()))?;
-    spinner.update_tokens(usage_p.input_tokens + usage_p.output_tokens);
+    add_global_tokens(&global_tokens, &usage_p);
     spinner.stop();
     record_usage(state, &usage_p);
 
@@ -728,7 +802,6 @@ Rules:
     }
     println!();
 
-    // Read-only: stop here
     if !edit_mode {
         println!("{YELLOW}⚠️  只读模式，跳过代码生成 / Read-only mode — use /edit to enable{RESET}");
         return Ok(());
@@ -738,14 +811,12 @@ Rules:
     // Phase 4: Execution
     // ════════════════════════════════════════════════════════════════════
 
-    // Git checkpoint — one per session, before any writes
     let checkpoint_info = git_checkpoint(&work_dir, user_request);
     state.lock().unwrap().checkpoint_count += 1;
     println!("{CYAN}  ● Git(checkpoint){RESET}");
     println!("  {GRAY}⎿  {checkpoint_info}{RESET}");
     println!();
 
-    // Auto-create Cargo.toml if this appears to be a Rust project
     let is_rust = plan.steps.iter()
         .flat_map(|s| s.files_to_create.iter())
         .any(|f| f.ends_with(".rs"));
@@ -763,45 +834,56 @@ Rules:
         let exec_model = resolve_model(&step.assigned_model);
         let exec_opts = if exec_model == QWEN { qwen_gen_opts() } else { dsr1_opts() };
 
-        // Pull in any files this step needs from disk (from prior steps)
         let prior_code = gather_existing_code(&work_dir, &step.files_to_create);
 
+        // Fix 3b + 1c + 5a: gen prompt includes role, mental model, and [THINK] instruction.
         let gen_prompt = format!(
-            r#"## Environment
-- OS: Windows 11
-- Shell: PowerShell
-- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)
-- Path separator: \
-
-Project: {request}
-Task type: {task_type}
-
-Existing relevant code:
-{prior_code}
-
-Your submodule task:
-{submodule_prompt}
-
-Target files: {files}
-
-Generate COMPLETE, compilable code for each file. Format every file as:
-```rust filename="path/to/file.rs"
-// full code here
-```
-All comments and text in {lang}."#,
+            "{role}{mental_model}## Environment\n\
+- OS: Windows 11\n\
+- Shell: PowerShell\n\
+- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)\n\
+- Path separator: \\\n\n\
+Project: {request}\n\
+Task type: {task_type}\n\n\
+Existing relevant code:\n\
+{prior_code}\n\n\
+Your submodule task:\n\
+{submodule_prompt}\n\n\
+Target files: {files}\n\n\
+在生成代码之前，请先用 [THINK] 标记输出你的思考过程：\n\
+- 这个模块的输入是什么\n\
+- 需要产生什么输出\n\
+- 关键的数据结构和函数签名\n\
+- 可能的边界情况\n\n\
+然后再用代码块输出完整代码。\n\n\
+Generate COMPLETE, compilable code for each file. Format every file as:\n\
+```rust filename=\"path/to/file.rs\"\n// full code here\n```\n\
+All comments and text in {lang}.",
+            role = ROLE_HEADER,
+            mental_model = mental_model_section(&analysis_doc),
             request = user_request,
             task_type = analysis.task_type,
             submodule_prompt = step.submodule_prompt,
             files = step.files_to_create.join(", "),
             lang = output_lang,
+            prior_code = prior_code,
         );
 
         // 4a: Generate
-        let spinner = Spinner::new(SpinnerState::Crafting);
+        let spinner = Spinner::new(SpinnerState::Crafting, Arc::clone(&global_tokens), Arc::clone(&global_start));
         let (code_raw, usage_c) = ollama.chat(exec_model, &gen_prompt, Some(&exec_opts))?;
-        spinner.update_tokens(usage_c.input_tokens + usage_c.output_tokens);
+        add_global_tokens(&global_tokens, &usage_c);
         spinner.stop();
         record_usage(state, &usage_c);
+
+        // Fix 5b: Display [THINK] content in gray before writing files.
+        if let Some(think) = extract_think_block(&code_raw) {
+            println!("{GRAY}  [THINK]{RESET}");
+            for line in think.lines().take(8) {
+                println!("    {GRAY}{}{RESET}", line.trim());
+            }
+            println!();
+        }
 
         let blocks = extract_code_blocks(&code_raw);
         if blocks.is_empty() {
@@ -811,17 +893,15 @@ All comments and text in {lang}."#,
         }
 
         // 4b: Review loop (max REVIEW_MAX_ATTEMPTS)
-        let mut fix_prompt_extra = String::new();
         for review_attempt in 1..=REVIEW_MAX_ATTEMPTS {
-            let review_prompt = build_review_prompt(step, &written_files);
+            let review_prompt = build_review_prompt(step, &written_files, &analysis_doc);
 
-            let spinner = Spinner::new(SpinnerState::Reviewing);
+            let spinner = Spinner::new(SpinnerState::Reviewing, Arc::clone(&global_tokens), Arc::clone(&global_start));
             let (review_raw, usage_r) = ollama.chat(QWEN, &review_prompt, Some(&qwen_ctx_opts()))?;
-            spinner.update_tokens(usage_r.input_tokens + usage_r.output_tokens);
+            add_global_tokens(&global_tokens, &usage_r);
             spinner.stop();
             record_usage(state, &usage_r);
 
-            // Show condensed review output
             print!("{CYAN}  [Review {review_attempt}/{REVIEW_MAX_ATTEMPTS}]{RESET} ");
             if !review_has_warnings(&review_raw) {
                 println!("{GREEN}✓ passed{RESET}");
@@ -829,7 +909,6 @@ All comments and text in {lang}."#,
             }
 
             println!("{YELLOW}⚠ issues found{RESET}");
-            // Show first warning line
             for line in review_raw.lines().filter(|l| l.contains('⚠')).take(3) {
                 println!("    {YELLOW}{}{RESET}", line.trim());
             }
@@ -839,13 +918,11 @@ All comments and text in {lang}."#,
                 break;
             }
 
-            // Fix
-            fix_prompt_extra.push_str(&format!("\n\n[Review {}]\n{}", review_attempt, review_raw));
-            let fix_prompt = build_fix_prompt(step, &written_files, &review_raw, &output_lang);
+            let fix_prompt = build_fix_prompt(step, &written_files, &review_raw, &output_lang, &analysis_doc);
 
-            let spinner = Spinner::new(SpinnerState::Fixing);
+            let spinner = Spinner::new(SpinnerState::Fixing, Arc::clone(&global_tokens), Arc::clone(&global_start));
             let (fixed_raw, usage_f) = ollama.chat(exec_model, &fix_prompt, Some(&exec_opts))?;
-            spinner.update_tokens(usage_f.input_tokens + usage_f.output_tokens);
+            add_global_tokens(&global_tokens, &usage_f);
             spinner.stop();
             record_usage(state, &usage_f);
 
@@ -870,17 +947,16 @@ All comments and text in {lang}."#,
 
         for arch_iter in 1..=ARCH_MAX_ITERATIONS {
             let all_code_ctx = build_code_context(&written_files);
-            let arch_prompt = build_architect_prompt(user_request, &plan_summary, &all_code_ctx);
+            let arch_prompt = build_architect_prompt(user_request, &plan_summary, &all_code_ctx, &analysis_doc);
 
             println!("{CYAN}🏛️  架构师检查 / Architect check ({arch_iter}/{ARCH_MAX_ITERATIONS})...{RESET}");
 
-            let spinner = Spinner::new(SpinnerState::Architecting);
+            let spinner = Spinner::new(SpinnerState::Architecting, Arc::clone(&global_tokens), Arc::clone(&global_start));
             let (arch_raw, usage_arch) = ollama.chat(DSR1, &arch_prompt, Some(&dsr1_opts()))?;
-            spinner.update_tokens(usage_arch.input_tokens + usage_arch.output_tokens);
+            add_global_tokens(&global_tokens, &usage_arch);
             spinner.stop();
             record_usage(state, &usage_arch);
 
-            // Show condensed architect output
             for line in arch_raw.lines().take(8) {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
@@ -900,13 +976,12 @@ All comments and text in {lang}."#,
                 break;
             }
 
-            // 4d: Fix — let dsr1 fix all issues at once
             let all_code_ctx = build_code_context(&written_files);
-            let rework_prompt = build_rework_prompt(user_request, &arch_raw, &all_code_ctx, &output_lang);
+            let rework_prompt = build_rework_prompt(user_request, &arch_raw, &all_code_ctx, &output_lang, &analysis_doc);
 
-            let spinner = Spinner::new(SpinnerState::FixingDsr1);
+            let spinner = Spinner::new(SpinnerState::FixingDsr1, Arc::clone(&global_tokens), Arc::clone(&global_start));
             let (rework_raw, usage_rw) = ollama.chat(DSR1, &rework_prompt, Some(&dsr1_opts()))?;
-            spinner.update_tokens(usage_rw.input_tokens + usage_rw.output_tokens);
+            add_global_tokens(&global_tokens, &usage_rw);
             spinner.stop();
             record_usage(state, &usage_rw);
 
@@ -945,28 +1020,19 @@ All comments and text in {lang}."#,
 
             let all_code_ctx = build_code_context(&written_files);
             let cargo_fix_prompt = format!(
-                r#"## Environment
-- OS: Windows 11
-- Shell: PowerShell
-
-编译错误（尝试 {attempt}/{CARGO_FIX_MAX}）：
-```
-{err}
-```
-
-当前代码：
-{all_code_ctx}
-
-请修复所有编译错误，输出完整修复后的代码，格式：
-```rust filename="path/to/file.rs"
-// full corrected code
-```
-所有说明用 {output_lang}。"#
+                "{role}{mental_model}## Environment\n- OS: Windows 11\n- Shell: PowerShell\n\n\
+编译错误（尝试 {attempt}/{CARGO_FIX_MAX}）：\n```\n{err}\n```\n\n\
+当前代码：\n{all_code_ctx}\n\n\
+请修复所有编译错误，输出完整修复后的代码，格式：\n\
+```rust filename=\"path/to/file.rs\"\n// full corrected code\n```\n\
+所有说明用 {output_lang}。",
+                role = ROLE_HEADER,
+                mental_model = mental_model_section(&analysis_doc),
             );
 
-            let spinner = Spinner::new(SpinnerState::FixingDsr1);
+            let spinner = Spinner::new(SpinnerState::FixingDsr1, Arc::clone(&global_tokens), Arc::clone(&global_start));
             let (fix_raw, usage_fix) = ollama.chat(DSR1, &cargo_fix_prompt, Some(&dsr1_opts()))?;
-            spinner.update_tokens(usage_fix.input_tokens + usage_fix.output_tokens);
+            add_global_tokens(&global_tokens, &usage_fix);
             spinner.stop();
             record_usage(state, &usage_fix);
 
@@ -983,11 +1049,54 @@ All comments and text in {lang}."#,
     println!();
     print_change_summary(&all_completed);
 
-    let structure = list_files_in(&work_dir).join("\n");
-    let _ = rules_mgr.update(&all_completed, &structure);
-    println!("{GRAY}📄 规则文件已更新 / Rules updated{RESET}");
+    // Fix 6: Ask DSR1 to update .sakichan.md with this session's findings.
+    let steps_summary = plan.steps.iter().enumerate().map(|(i, s)| {
+        format!("{}. {} ({})", i + 1, s.name, s.files_to_create.join(", "))
+    }).collect::<Vec<_>>().join("\n");
 
-    let elapsed = run_start.elapsed().as_secs_f64();
+    let current_rules = rules_mgr.load();
+    let rules_update_prompt = format!(
+        "## 本次对话完成的工作\n{steps_summary}\n\n\
+## 当前 .sakichan.md 内容\n{current_rules}\n\n\
+请基于本次对话的发现，更新项目规则文件。\n\
+保留原有的重要信息，追加新的发现。\n\
+输出用 [RULES_UPDATE] 标记。"
+    );
+
+    let spinner = Spinner::new(SpinnerState::Thinking, Arc::clone(&global_tokens), Arc::clone(&global_start));
+    let rules_updated = match ollama.chat(DSR1, &rules_update_prompt, Some(&dsr1_opts())) {
+        Ok((rules_raw, usage_ru)) => {
+            add_global_tokens(&global_tokens, &usage_ru);
+            spinner.stop();
+            record_usage(state, &usage_ru);
+            if let Some(new_rules) = extract_rules_update(&rules_raw) {
+                let ok = fs::write(work_dir.join(".sakichan.md"), &new_rules).is_ok();
+                if ok { println!("{GRAY}📄 规则文件已由 AI 更新 / Rules updated by AI{RESET}"); }
+                ok
+            } else {
+                false
+            }
+        }
+        Err(_) => {
+            spinner.stop();
+            false
+        }
+    };
+
+    if !rules_updated {
+        let structure = list_files_in(&work_dir).join("\n");
+        let _ = rules_mgr.update(&all_completed, &structure);
+        println!("{GRAY}📄 规则文件已更新 / Rules updated{RESET}");
+    }
+
+    let elapsed_secs = global_start.elapsed().as_secs();
+    let elapsed_f = global_start.elapsed().as_secs_f64();
+    let elapsed_str = if elapsed_secs >= 60 {
+        format!("{}m {}s", elapsed_secs / 60, elapsed_secs % 60)
+    } else {
+        format!("{}s", elapsed_secs)
+    };
+
     let _ = logger.log_task(
         user_request,
         &analysis.task_type,
@@ -995,19 +1104,13 @@ All comments and text in {lang}."#,
         compile_ok,
         &[],
         DSR1,
-        elapsed,
+        elapsed_f,
     );
     let log_name = format!(
         "{}_log.md",
         work_dir.file_name().unwrap_or_default().to_string_lossy()
     );
     println!("{GRAY}📝 日志已更新 → {log_name}{RESET}");
-
-    let elapsed_str = if elapsed >= 60.0 {
-        format!("{}m {:.0}s", elapsed as u64 / 60, elapsed % 60.0)
-    } else {
-        format!("{:.1}s", elapsed)
-    };
     println!("{PINK}✻ Baked for {elapsed_str}{RESET}");
 
     context.push(format!("User: {user_request}"));
@@ -1018,6 +1121,29 @@ All comments and text in {lang}."#,
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let _ = state.lock().unwrap().save_session(&session_id, context);
+
+    // Fix 9: Auto git commit after Phase 5.
+    let summary: String = user_request.lines().next().unwrap_or("").chars().take(50).collect();
+    let commit_msg = format!("sakichan: {}", summary.trim());
+    let _ = Command::new("git").args(["add", "-A"]).current_dir(&work_dir).output();
+    match Command::new("git")
+        .args(["commit", "-m", &commit_msg, "--allow-empty"])
+        .current_dir(&work_dir)
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            println!("{CYAN}● Git(commit){RESET}");
+            println!("  {GRAY}⎿  Committed: {commit_msg}{RESET}");
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let first = err.lines().next().unwrap_or("").trim();
+            if !first.is_empty() {
+                println!("{GRAY}● Git(commit): {first}{RESET}");
+            }
+        }
+        Err(e) => println!("{YELLOW}● Git(commit): Error: {e}{RESET}"),
+    }
 
     Ok(())
 }

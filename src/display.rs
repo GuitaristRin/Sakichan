@@ -16,6 +16,29 @@ pub const ORANGE: &str = "\x1b[38;5;208m";
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+pub fn format_num(n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+fn fmt_elapsed(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
 pub fn print_welcome(version: &str, models: &[String]) {
     println!();
     println!("{PINK}{BOLD}╭──────────────────────────────────────────╮{RESET}");
@@ -151,38 +174,36 @@ impl SpinnerState {
     }
 }
 
+// Fix 7: Spinner now takes shared global token counter and start time.
+// Timer and token count never reset between phases.
 pub struct Spinner {
     stop: Arc<Mutex<bool>>,
-    token_count: Arc<Mutex<u64>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Spinner {
-    pub fn new(state: SpinnerState) -> Self {
+    pub fn new(
+        state: SpinnerState,
+        global_tokens: Arc<Mutex<u64>>,
+        global_start: Arc<Instant>,
+    ) -> Self {
         let stop = Arc::new(Mutex::new(false));
-        let token_count = Arc::new(Mutex::new(0u64));
         let stop_clone = Arc::clone(&stop);
-        let token_clone = Arc::clone(&token_count);
         let label = state.label().to_string();
         let color = state.color().to_string();
 
         let handle = thread::spawn(move || {
-            let start = Instant::now();
             let mut i = 0usize;
             loop {
-                {
-                    let s = stop_clone.lock().unwrap();
-                    if *s { break; }
-                }
-                let elapsed = start.elapsed().as_secs_f64();
-                let elapsed_str = if elapsed >= 60.0 {
-                    format!("{}m {:.1}s", elapsed as u64 / 60, elapsed % 60.0)
-                } else {
-                    format!("{:.1}s", elapsed)
-                };
-                let tokens = token_clone.lock().unwrap();
+                if *stop_clone.lock().unwrap() { break; }
+                let elapsed = global_start.elapsed().as_secs();
+                let tokens = *global_tokens.lock().unwrap();
                 let frame = SPINNER_FRAMES[i % SPINNER_FRAMES.len()];
-                print!("\r  {color}🟠 {frame} {label}{RESET} {GRAY}({elapsed_str} · {} tokens){RESET}   ", *tokens);
+                print!(
+                    "\r  {color}🟠 {frame} {label}{RESET} {GRAY}({} · {} tokens){RESET}   ",
+                    fmt_elapsed(elapsed),
+                    format_num(tokens),
+                );
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 i += 1;
                 thread::sleep(Duration::from_millis(80));
@@ -191,20 +212,11 @@ impl Spinner {
             let _ = std::io::Write::flush(&mut std::io::stdout());
         });
 
-        Spinner { stop, token_count, handle: Some(handle) }
-    }
-
-    pub fn update_tokens(&self, count: u64) {
-        if let Ok(mut t) = self.token_count.lock() {
-            *t = count;
-        }
+        Spinner { stop, handle: Some(handle) }
     }
 
     pub fn stop(mut self) {
-        {
-            let mut s = self.stop.lock().unwrap();
-            *s = true;
-        }
+        *self.stop.lock().unwrap() = true;
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
