@@ -16,6 +16,24 @@ impl std::ops::AddAssign for UsageStats {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ModelOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_predict: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+}
+
 #[derive(Deserialize)]
 struct TagsResponse {
     models: Vec<ModelEntry>,
@@ -70,13 +88,16 @@ impl OllamaClient {
         Ok(tags.models.into_iter().map(|m| m.name).collect())
     }
 
-    pub fn chat(&self, model: &str, prompt: &str) -> Result<(String, UsageStats)> {
+    pub fn chat(&self, model: &str, prompt: &str, opts: Option<&ModelOptions>) -> Result<(String, UsageStats)> {
         let url = format!("http://{}/api/generate", self.host);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model,
             "prompt": prompt,
             "stream": true
         });
+        if let Some(o) = opts {
+            body["options"] = serde_json::to_value(o)?;
+        }
 
         let resp = self.client.post(&url).json(&body).send()?;
         if !resp.status().is_success() {

@@ -1,7 +1,7 @@
 use crate::display::*;
 use crate::executor::Executor;
 use crate::logger::Logger;
-use crate::ollama::OllamaClient;
+use crate::ollama::{ModelOptions, OllamaClient};
 use crate::rules::RulesManager;
 use crate::state::AppState;
 use anyhow::Result;
@@ -17,6 +17,41 @@ const QWEN: &str = "qwen2.5-coder:7b";
 const DSR1: &str = "deepseek-r1:8b";
 const QWEN_MAX_RETRIES: u32 = 5;
 const DSR1_MAX_RETRIES: u32 = 10;
+
+fn dsr1_opts() -> ModelOptions {
+    ModelOptions {
+        temperature: Some(0.3),
+        top_p: Some(0.85),
+        top_k: Some(40),
+        num_predict: Some(-1),
+        num_ctx: Some(8192),
+        ..Default::default()
+    }
+}
+
+fn qwen_ctx_opts() -> ModelOptions {
+    ModelOptions {
+        temperature: Some(0.1),
+        top_p: Some(0.8),
+        top_k: Some(20),
+        num_predict: Some(2048),
+        repeat_penalty: Some(1.05),
+        seed: Some(42),
+        num_ctx: Some(8192),
+    }
+}
+
+fn qwen_gen_opts() -> ModelOptions {
+    ModelOptions {
+        temperature: Some(0.2),
+        top_p: Some(0.8),
+        top_k: Some(20),
+        num_predict: Some(2048),
+        repeat_penalty: Some(1.05),
+        seed: Some(42),
+        num_ctx: Some(8192),
+    }
+}
 
 #[derive(Debug, Deserialize, Default)]
 struct AnalysisResponse {
@@ -274,7 +309,8 @@ fn gather_context(
         "Extract file names/paths explicitly mentioned in this user request. Return ONLY a JSON array of strings. If none, return [].\n\nUser request: {user_request}\nAvailable files: {files_str}\n\nReturn ONLY like: [\"src/main.rs\", \"Cargo.toml\"]"
     );
 
-    let Ok((response, _)) = ollama.chat(QWEN, &prompt) else {
+    let opts = qwen_ctx_opts();
+    let Ok((response, _)) = ollama.chat(QWEN, &prompt, Some(&opts)) else {
         return user_request.to_string();
     };
 
@@ -386,7 +422,8 @@ Complexity is 1-10. All explanation text in {lang}."#,
     );
 
     let spinner = Spinner::new(SpinnerState::Thinking);
-    let (analysis_raw, usage_a) = ollama.chat(DSR1, &prompt_a)?;
+    let a_opts = dsr1_opts();
+    let (analysis_raw, usage_a) = ollama.chat(DSR1, &prompt_a, Some(&a_opts))?;
     spinner.update_tokens(usage_a.input_tokens + usage_a.output_tokens);
     spinner.stop();
     record_usage(state, &usage_a);
@@ -496,7 +533,8 @@ Respond with ONLY JSON (all explanation text in {}):
     );
 
     let spinner = Spinner::new(SpinnerState::Thinking);
-    let (plan_raw, usage_p) = ollama.chat(DSR1, &prompt_p)?;
+    let p_opts = dsr1_opts();
+    let (plan_raw, usage_p) = ollama.chat(DSR1, &prompt_p, Some(&p_opts))?;
     spinner.update_tokens(usage_p.input_tokens + usage_p.output_tokens);
     spinner.stop();
     record_usage(state, &usage_p);
@@ -597,7 +635,8 @@ Write FULL compilable code. All explanation in {lang}."#,
         for attempt in 1..=QWEN_MAX_RETRIES {
             let spinner_state = if attempt == 1 { SpinnerState::Crafting } else { SpinnerState::Fixing };
             let spinner = Spinner::new(spinner_state);
-            let (code_raw, usage_c) = ollama.chat(&step_model, &prompt_c)?;
+            let exec_opts = if step_model == QWEN { qwen_gen_opts() } else { dsr1_opts() };
+            let (code_raw, usage_c) = ollama.chat(&step_model, &prompt_c, Some(&exec_opts))?;
             spinner.update_tokens(usage_c.input_tokens + usage_c.output_tokens);
             spinner.stop();
             record_usage(state, &usage_c);
@@ -645,7 +684,8 @@ Write FULL compilable code. All explanation in {lang}."#,
 
             for attempt in 1..=DSR1_MAX_RETRIES {
                 let spinner = Spinner::new(SpinnerState::FixingDsr1);
-                let (code_raw, usage_c) = ollama.chat(&step_model, &prompt_c)?;
+                let fb_opts = dsr1_opts();
+                let (code_raw, usage_c) = ollama.chat(&step_model, &prompt_c, Some(&fb_opts))?;
                 spinner.update_tokens(usage_c.input_tokens + usage_c.output_tokens);
                 spinner.stop();
                 record_usage(state, &usage_c);
