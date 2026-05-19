@@ -143,6 +143,7 @@ pub enum SpinnerState {
     Mistaking,
     Reviewing,
     Architecting,
+    Evaluating,
 }
 
 impl SpinnerState {
@@ -157,6 +158,7 @@ impl SpinnerState {
             SpinnerState::Mistaking => "Mistaking...",
             SpinnerState::Reviewing => "Reviewing...",
             SpinnerState::Architecting => "Architecting...",
+            SpinnerState::Evaluating => "Evaluating...",
         }
     }
 
@@ -165,7 +167,8 @@ impl SpinnerState {
             SpinnerState::Thinking
             | SpinnerState::ThinkingMore
             | SpinnerState::AlmostFinished
-            | SpinnerState::Architecting => ORANGE,
+            | SpinnerState::Architecting
+            | SpinnerState::Evaluating => ORANGE,
             SpinnerState::Crafting => GREEN,
             SpinnerState::Fixing | SpinnerState::FixingDsr1 => RED,
             SpinnerState::Mistaking => GRAY,
