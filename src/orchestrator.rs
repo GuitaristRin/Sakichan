@@ -110,6 +110,8 @@ struct PlanStep {
     files_to_create: Vec<String>,
     #[serde(default)]
     verification: String,
+    #[serde(default)]
+    needs_compile: bool,
 }
 
 fn default_model() -> String { "QWEN".to_string() }
@@ -756,12 +758,15 @@ Decisions made: {decisions}\n\
 Project rules: {rules}\n\
 Existing files: {files_str}\n\n\
 Output ONLY valid JSON with this schema:\n\
-{{\"steps\":[{{\"id\":1,\"name\":\"动词开头的步骤名\",\"submodule_prompt\":\"完整独立prompt，包含：职责、输入接口、输出规范、不负责的范围。执行模型无需其他上下文即可完成工作。\",\"assigned_model\":\"QWEN\",\"files_to_create\":[\"path/to/file.rs\"],\"verification\":\"如何验证\"}}]}}\n\n\
+{{\"steps\":[{{\"id\":1,\"name\":\"动词开头的步骤名\",\"submodule_prompt\":\"完整独立prompt，包含：职责、输入接口、输出规范、不负责的范围。执行模型无需其他上下文即可完成工作。\",\"assigned_model\":\"QWEN\",\"files_to_create\":[\"path/to/file.rs\"],\"needs_compile\":false,\"verification\":\"如何验证\"}}]}}\n\n\
 Rules:\n\
 - submodule_prompt MUST be self-contained; orchestrator will prepend project background\n\
 - assigned_model is \"QWEN\" (for straightforward tasks) or \"DSR1\" (for complex logic/architecture)\n\
 - step names MUST start with a verb (e.g. \"实现 Fibonacci 函数\", not \"Fibonacci 函数\")\n\
 - If task has no code to write (analysis, essay, etc.), steps should create output files\n\
+- needs_compile: true ONLY if this step produces source code intended for compilation (e.g. .rs, .cpp, .c)\n\
+- needs_compile: false for documentation, reports, analysis, markdown, config files, plain text, etc.\n\
+- When in doubt, set needs_compile to false\n\
 - All text in {lang}",
         role = ROLE_HEADER,
         mental_model = mental_model_section(&analysis_doc),
@@ -790,14 +795,16 @@ Rules:\n\
                 assigned_model: "QWEN".to_string(),
                 files_to_create: vec!["src/main.rs".to_string()],
                 verification: "检查文件".to_string(),
+                needs_compile: false,
             }],
         });
 
     println!("{CYAN}步骤 / Steps:{RESET}");
     for step in &plan.steps {
+        let kind = if step.needs_compile { "🔨" } else { "📝" };
         println!(
-            "  {GREEN}{}. {} {GRAY}[{}]{RESET}",
-            step.id, step.name, step.assigned_model
+            "  {GREEN}{}. {} {GRAY}[{}] {}{RESET}",
+            step.id, step.name, step.assigned_model, kind
         );
     }
     println!();
@@ -817,10 +824,8 @@ Rules:\n\
     println!("  {GRAY}⎿  {checkpoint_info}{RESET}");
     println!();
 
-    let is_rust = plan.steps.iter()
-        .flat_map(|s| s.files_to_create.iter())
-        .any(|f| f.ends_with(".rs"));
-    if is_rust { ensure_cargo_toml(&work_dir); }
+    let any_needs_compile = plan.steps.iter().any(|s| s.needs_compile);
+    if any_needs_compile { ensure_cargo_toml(&work_dir); }
 
     let mut written_files: HashMap<String, String> = HashMap::new();
     let mut all_completed: Vec<String> = Vec::new();
@@ -992,10 +997,10 @@ All comments and text in {lang}.",
         }
     }
 
-    // ── 4e: Compilation gate (Rust projects only) ─────────────────────
+    // ── 4e: Compilation gate (skipped for documentation-only steps) ──────
 
     let mut compile_ok = true;
-    if work_dir.join("Cargo.toml").exists() && !written_files.is_empty() {
+    if work_dir.join("Cargo.toml").exists() && !written_files.is_empty() && any_needs_compile {
         println!();
         println!("{CYAN}🔍 编译检查 / Cargo check...{RESET}");
         compile_ok = false;
@@ -1041,6 +1046,8 @@ All comments and text in {lang}.",
                 write_step_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed);
             }
         }
+    } else if !written_files.is_empty() && !any_needs_compile {
+        println!("{CYAN}📝 文档步骤，跳过编译{RESET}");
     }
 
     // ════════════════════════════════════════════════════════════════════
