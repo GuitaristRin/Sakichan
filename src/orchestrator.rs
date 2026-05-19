@@ -192,6 +192,81 @@ fn generate_project_tree(work_dir: &Path) -> String {
     lines.join("\n")
 }
 
+// ── Grep helpers ──────────────────────────────────────────────────────────────
+
+const GREP_TEXT_EXTS: &[&str] = &[
+    "rs", "toml", "md", "txt", "json", "yaml", "yml",
+    "py", "js", "ts", "tsx", "cpp", "c", "h", "go", "java",
+];
+const GREP_SKIP_DIRS: &[&str] = &["target", ".git", ".sakichan"];
+
+fn grep_file(root: &Path, path: &Path, pattern: &str, ctx: usize, results: &mut Vec<String>) {
+    let Ok(content) = fs::read_to_string(path) else { return };
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let lines: Vec<&str> = content.lines().collect();
+
+    let match_indices: Vec<usize> = lines.iter().enumerate()
+        .filter(|(_, l)| l.to_lowercase().contains(pattern))
+        .map(|(i, _)| i)
+        .collect();
+    if match_indices.is_empty() { return; }
+
+    let mut shown = std::collections::BTreeSet::<usize>::new();
+    for &idx in &match_indices {
+        for j in idx.saturating_sub(ctx)..(idx + ctx + 1).min(lines.len()) {
+            shown.insert(j);
+        }
+    }
+
+    let shown_vec: Vec<usize> = shown.into_iter().collect();
+    let mut prev: Option<usize> = None;
+    for &j in &shown_vec {
+        if let Some(p) = prev { if j > p + 1 { results.push("  ---".to_string()); } }
+        let marker = if match_indices.contains(&j) { "▶" } else { " " };
+        results.push(format!("{}:{} {} {}", rel.display(), j + 1, marker, lines[j]));
+        prev = Some(j);
+    }
+}
+
+fn grep_walk(root: &Path, dir: &Path, pattern: &str, ctx: usize, results: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if GREP_SKIP_DIRS.contains(&name.as_str()) { continue; }
+        let path = entry.path();
+        if path.is_dir() {
+            grep_walk(root, &path, pattern, ctx, results);
+        } else if path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if GREP_TEXT_EXTS.contains(&ext) {
+                grep_file(root, &path, pattern, ctx, results);
+            }
+        }
+    }
+}
+
+fn grep_in_dir(work_dir: &Path, pattern: &str, search_path: &str, ctx: usize) -> String {
+    let pattern_lower = pattern.to_lowercase();
+    let search_dir = if search_path.is_empty() || search_path == "." {
+        work_dir.to_path_buf()
+    } else {
+        work_dir.join(search_path)
+    };
+    let mut results: Vec<String> = Vec::new();
+    grep_walk(&search_dir, &search_dir, &pattern_lower, ctx, &mut results);
+    if results.is_empty() {
+        format!("[GREP: no matches for \"{pattern}\" in {search_path}]")
+    } else {
+        let count = results.iter().filter(|l| l.contains('▶')).count();
+        format!(
+            "[GREP \"{pattern}\" — {count} matches]\n{}\n[/GREP]",
+            results.join("\n")
+        )
+    }
+}
+
 fn extract_code_blocks(response: &str) -> Vec<(String, String, String)> {
     let mut results = Vec::new();
     let re1 = regex::Regex::new(
@@ -227,6 +302,44 @@ fn extract_code_blocks(response: &str) -> Vec<(String, String, String)> {
         }
     }
     results
+}
+
+// ── Patch application ─────────────────────────────────────────────────────────
+
+fn apply_patch(filename: &str, patch_content: &str, work_dir: &Path) -> Result<bool, String> {
+    const OLD_M: &str = "---OLD---";
+    const NEW_M: &str = "---NEW---";
+    const END_M: &str = "---END---";
+
+    let Some(old_pos) = patch_content.find(OLD_M) else {
+        return Err("missing ---OLD--- marker".to_string());
+    };
+    let after_old = patch_content[old_pos + OLD_M.len()..].trim_start_matches('\n');
+
+    let Some(new_pos) = after_old.find(NEW_M) else {
+        return Err("missing ---NEW--- marker".to_string());
+    };
+    let old_content = after_old[..new_pos].trim_end_matches('\n');
+
+    let after_new = after_old[new_pos + NEW_M.len()..].trim_start_matches('\n');
+    let end_pos = after_new.find(END_M).unwrap_or(after_new.len());
+    let new_content = after_new[..end_pos].trim_end_matches('\n');
+
+    if old_content.is_empty() {
+        return Err("---OLD--- section is empty".to_string());
+    }
+
+    let fpath = work_dir.join(filename);
+    if !fpath.exists() {
+        return Err(format!("file not found: {filename}"));
+    }
+    let current = fs::read_to_string(&fpath).map_err(|e| e.to_string())?;
+    if !current.contains(old_content) {
+        return Err(format!("OLD section not found verbatim in {filename} — use full-file format instead"));
+    }
+    let updated = current.replacen(old_content, new_content, 1);
+    fs::write(&fpath, &updated).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 fn parse_json_from_response(response: &str) -> Option<String> {
@@ -285,6 +398,25 @@ fn process_system_calls(response: &str, work_dir: &Path) -> (String, String) {
         } else { break; }
     }
 
+    while let Some(start) = clean.find("[SYSTEM:grep") {
+        if let Some(end) = clean[start..].find(']') {
+            let tag = &clean[start..start + end + 1];
+            let pattern = tag.find("pattern=\"")
+                .map(|p| { let r = &tag[p + 9..]; r[..r.find('"').unwrap_or(r.len())].to_string() })
+                .unwrap_or_default();
+            let path = tag.find("path=\"")
+                .map(|p| { let r = &tag[p + 6..]; r[..r.find('"').unwrap_or(r.len())].to_string() })
+                .unwrap_or_else(|| ".".to_string());
+            let ctx = tag.find("context=\"")
+                .and_then(|p| { let r = &tag[p + 9..]; r[..r.find('"').unwrap_or(r.len())].parse::<usize>().ok() })
+                .unwrap_or(2);
+            if !pattern.is_empty() {
+                tool_results.push_str(&format!("\n{}\n", grep_in_dir(work_dir, &pattern, &path, ctx)));
+            }
+            clean = format!("{}{}", &clean[..start], &clean[start + end + 1..]);
+        } else { break; }
+    }
+
     (clean, tool_results)
 }
 
@@ -324,21 +456,46 @@ fn ensure_cargo_toml(work_dir: &Path) {
     }
 }
 
-fn write_step_files(
+fn write_or_patch_files(
     blocks: &[(String, String, String)],
     work_dir: &Path,
     written_files: &mut HashMap<String, String>,
     all_completed: &mut Vec<String>,
 ) {
-    for (_, filename, code) in blocks {
+    for (lang, filename, code) in blocks {
         if filename.is_empty() { continue; }
-        let fpath = work_dir.join(filename);
-        let old_content = fs::read_to_string(&fpath).unwrap_or_default();
-        if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
-        let _ = fs::write(&fpath, code);
-        print_code_diff(filename, &old_content, code);
-        written_files.insert(filename.clone(), code.clone());
-        all_completed.push(filename.clone());
+
+        if lang == "patch" {
+            let old_snapshot = written_files.get(filename).cloned()
+                .or_else(|| fs::read_to_string(work_dir.join(filename)).ok())
+                .unwrap_or_default();
+            match apply_patch(filename, code, work_dir) {
+                Ok(true) => {
+                    let updated = fs::read_to_string(work_dir.join(filename)).unwrap_or_default();
+                    print_code_diff(filename, &old_snapshot, &updated);
+                    written_files.insert(filename.clone(), updated);
+                    if !all_completed.contains(filename) { all_completed.push(filename.clone()); }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    println!("{YELLOW}  ⚠ Patch failed ({e}), falling back to full write{RESET}");
+                    let fpath = work_dir.join(filename);
+                    if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
+                    let _ = fs::write(&fpath, code);
+                    print_code_diff(filename, &old_snapshot, code);
+                    written_files.insert(filename.clone(), code.clone());
+                    if !all_completed.contains(filename) { all_completed.push(filename.clone()); }
+                }
+            }
+        } else {
+            let fpath = work_dir.join(filename);
+            let old_content = fs::read_to_string(&fpath).unwrap_or_default();
+            if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
+            let _ = fs::write(&fpath, code);
+            print_code_diff(filename, &old_content, code);
+            written_files.insert(filename.clone(), code.clone());
+            if !all_completed.contains(filename) { all_completed.push(filename.clone()); }
+        }
     }
 }
 
@@ -510,11 +667,15 @@ fn build_fix_prompt(
     format!(
         "{mental_model}## Environment\n- OS: Windows 11\n- Shell: PowerShell\n\n\
 审查意见如下，请修复所有标记了 ⚠ 的问题。\n\n\
+可以先搜索相关代码再修复：[SYSTEM:grep pattern=\"符号名\" path=\"src\"]\n\n\
 审查结果：\n{review}\n\n\
 子模块要求：\n{submodule_prompt}\n\n\
 当前代码：\n{code_ctx}\n\n\
-请输出修复后的完整代码，格式：\n\
-```rust filename=\"path/to/file.rs\"\n// full corrected code\n```\n\
+## 输出格式（二选一）\n\
+小范围修复（推荐）：\n\
+```patch filename=\"path/to/file.rs\"\n---OLD---\n待替换的原始代码（必须与文件完全一致）\n---NEW---\n修复后的代码\n---END---\n```\n\
+大范围重写：\n\
+```rust filename=\"path/to/file.rs\"\n// 完整文件内容\n```\n\
 所有注释和说明用 {output_lang}。",
         mental_model = mental_model_section(analysis_doc),
         submodule_prompt = step.submodule_prompt,
@@ -553,8 +714,11 @@ fn build_rework_prompt(
 原始需求：{user_request}\n\n\
 架构师意见：\n{arch_feedback}\n\n\
 当前代码：\n{all_code}\n\n\
-对每个需要修改的文件输出完整修复后的代码，格式：\n\
-```rust filename=\"path/to/file.rs\"\n// full corrected code\n```\n\
+## 输出格式（每个受影响的文件二选一）\n\
+小范围修复（推荐）：\n\
+```patch filename=\"path/to/file.rs\"\n---OLD---\n待替换的原始代码\n---NEW---\n修复后的代码\n---END---\n```\n\
+大范围重写：\n\
+```rust filename=\"path/to/file.rs\"\n// 完整文件内容\n```\n\
 所有注释和说明用 {output_lang}。",
         mental_model = mental_model_section(analysis_doc),
     )
@@ -841,7 +1005,6 @@ Rules:\n\
 
         let prior_code = gather_existing_code(&work_dir, &step.files_to_create);
 
-        // Fix 3b + 1c + 5a: gen prompt includes role, mental model, and [THINK] instruction.
         let gen_prompt = format!(
             "{role}{mental_model}## Environment\n\
 - OS: Windows 11\n\
@@ -855,13 +1018,19 @@ Existing relevant code:\n\
 Your submodule task:\n\
 {submodule_prompt}\n\n\
 Target files: {files}\n\n\
+## 可用上下文工具（需要时优先调用，然后再生成代码）\n\
+- 搜索符号/函数定义：[SYSTEM:grep pattern=\"symbol_name\" path=\"src\"]\n\
+- 读取文件：[SYSTEM:read_file path=\"src/file.rs\"]\n\n\
 在生成代码之前，请先用 [THINK] 标记输出你的思考过程：\n\
 - 这个模块的输入是什么\n\
 - 需要产生什么输出\n\
 - 关键的数据结构和函数签名\n\
 - 可能的边界情况\n\n\
-然后再用代码块输出完整代码。\n\n\
-Generate COMPLETE, compilable code for each file. Format every file as:\n\
+然后再用代码块输出。\n\n\
+## 输出格式（二选一）\n\
+对已存在文件做小范围修改（推荐，节省 token）：\n\
+```patch filename=\"path/to/file.rs\"\n---OLD---\n待替换的原始代码（必须与文件完全一致，包括空格和换行）\n---NEW---\n替换后的代码\n---END---\n```\n\
+新文件或大规模重写：\n\
 ```rust filename=\"path/to/file.rs\"\n// full code here\n```\n\
 All comments and text in {lang}.",
             role = ROLE_HEADER,
@@ -881,8 +1050,26 @@ All comments and text in {lang}.",
         spinner.stop();
         record_usage(state, &usage_c);
 
-        // Fix 5b: Display [THINK] content in gray before writing files.
-        if let Some(think) = extract_think_block(&code_raw) {
+        // Dynamic context: if model emitted SYSTEM tool calls, resolve them and do one round-trip
+        let (code_clean, tool_results_gen) = process_system_calls(&code_raw, &work_dir);
+        let final_code_raw = if !tool_results_gen.is_empty() {
+            println!("{GRAY}  🔍 模型请求上下文，解析后补充重新生成...{RESET}");
+            for line in tool_results_gen.lines().take(6) {
+                if !line.trim().is_empty() { println!("    {GRAY}{line}{RESET}"); }
+            }
+            let followup = format!(
+                "{gen_prompt}\n\n## Tool call results:\n{tool_results_gen}\n\nNow generate the complete output:"
+            );
+            let spinner2 = Spinner::new(SpinnerState::Crafting, Arc::clone(&global_tokens), Arc::clone(&global_start));
+            match ollama.chat(exec_model, &followup, Some(&exec_opts)) {
+                Ok((r, u)) => { add_global_tokens(&global_tokens, &u); spinner2.stop(); record_usage(state, &u); r }
+                Err(_)     => { spinner2.stop(); code_clean }
+            }
+        } else {
+            code_raw
+        };
+
+        if let Some(think) = extract_think_block(&final_code_raw) {
             println!("{GRAY}  [THINK]{RESET}");
             for line in think.lines().take(8) {
                 println!("    {GRAY}{}{RESET}", line.trim());
@@ -890,11 +1077,11 @@ All comments and text in {lang}.",
             println!();
         }
 
-        let blocks = extract_code_blocks(&code_raw);
+        let blocks = extract_code_blocks(&final_code_raw);
         if blocks.is_empty() {
             println!("{YELLOW}  ⚠ No code blocks generated for step {}{RESET}", step.id);
         } else {
-            write_step_files(&blocks, &work_dir, &mut written_files, &mut all_completed);
+            write_or_patch_files(&blocks, &work_dir, &mut written_files, &mut all_completed);
         }
 
         // 4b: Review loop (max REVIEW_MAX_ATTEMPTS)
@@ -933,7 +1120,7 @@ All comments and text in {lang}.",
 
             let fix_blocks = extract_code_blocks(&fixed_raw);
             if !fix_blocks.is_empty() {
-                write_step_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed);
+                write_or_patch_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed);
             }
         }
     }
@@ -962,9 +1149,14 @@ All comments and text in {lang}.",
             spinner.stop();
             record_usage(state, &usage_arch);
 
-            for line in arch_raw.lines().take(8) {
+            for line in arch_raw.lines().take(15) {
                 let trimmed = line.trim();
-                if !trimmed.is_empty() {
+                if trimmed.is_empty() { continue; }
+                if trimmed.contains("[MAJOR]") {
+                    println!("  {RED}{trimmed}{RESET}");
+                } else if trimmed.contains("[MINOR]") {
+                    println!("  {YELLOW}{trimmed}{RESET}");
+                } else {
                     println!("  {GRAY}{trimmed}{RESET}");
                 }
             }
@@ -992,7 +1184,7 @@ All comments and text in {lang}.",
 
             let rework_blocks = extract_code_blocks(&rework_raw);
             if !rework_blocks.is_empty() {
-                write_step_files(&rework_blocks, &work_dir, &mut written_files, &mut all_completed);
+                write_or_patch_files(&rework_blocks, &work_dir, &mut written_files, &mut all_completed);
             }
         }
     }
@@ -1017,18 +1209,34 @@ All comments and text in {lang}.",
 
             if attempt == CARGO_FIX_MAX {
                 println!("{RED}❌ 编译失败 after {CARGO_FIX_MAX} attempts{RESET}");
+                // Show final errors to user for transparency
+                println!("{RED}  ─── 最终编译错误 ───{RESET}");
+                for line in output.lines().take(25) {
+                    println!("  {RED}{line}{RESET}");
+                }
+                println!("{RED}  ────────────────────{RESET}");
                 break;
             }
 
             let err: String = output.chars().take(1500).collect();
             println!("{RED}  ✗ 编译失败 (attempt {attempt}), 修复中...{RESET}");
+            // Show errors to user so they can understand what's happening
+            for line in output.lines().take(12) {
+                if line.contains("error") || line.contains("warning") {
+                    println!("    {GRAY}{line}{RESET}");
+                }
+            }
 
             let all_code_ctx = build_code_context(&written_files);
             let cargo_fix_prompt = format!(
                 "{role}{mental_model}## Environment\n- OS: Windows 11\n- Shell: PowerShell\n\n\
 编译错误（尝试 {attempt}/{CARGO_FIX_MAX}）：\n```\n{err}\n```\n\n\
 当前代码：\n{all_code_ctx}\n\n\
-请修复所有编译错误，输出完整修复后的代码，格式：\n\
+可以先搜索相关符号：[SYSTEM:grep pattern=\"符号名\" path=\"src\"]\n\n\
+## 输出格式（二选一）\n\
+小范围修复（推荐）：\n\
+```patch filename=\"path/to/file.rs\"\n---OLD---\n待替换的原始代码\n---NEW---\n修复后的代码\n---END---\n```\n\
+大范围重写：\n\
 ```rust filename=\"path/to/file.rs\"\n// full corrected code\n```\n\
 所有说明用 {output_lang}。",
                 role = ROLE_HEADER,
@@ -1041,9 +1249,21 @@ All comments and text in {lang}.",
             spinner.stop();
             record_usage(state, &usage_fix);
 
-            let fix_blocks = extract_code_blocks(&fix_raw);
+            let (fix_clean, fix_tool_results) = process_system_calls(&fix_raw, &work_dir);
+            let final_fix_raw = if !fix_tool_results.is_empty() {
+                let followup = format!(
+                    "{cargo_fix_prompt}\n\n## Tool call results:\n{fix_tool_results}\n\nNow output the fix:"
+                );
+                let sp2 = Spinner::new(SpinnerState::FixingDsr1, Arc::clone(&global_tokens), Arc::clone(&global_start));
+                match ollama.chat(DSR1, &followup, Some(&dsr1_opts())) {
+                    Ok((r, u)) => { add_global_tokens(&global_tokens, &u); sp2.stop(); record_usage(state, &u); r }
+                    Err(_)     => { sp2.stop(); fix_clean }
+                }
+            } else { fix_raw };
+
+            let fix_blocks = extract_code_blocks(&final_fix_raw);
             if !fix_blocks.is_empty() {
-                write_step_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed);
+                write_or_patch_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed);
             }
         }
     } else if !written_files.is_empty() && !any_needs_compile {
