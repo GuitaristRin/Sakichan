@@ -51,7 +51,6 @@ pub fn print_cmd_result(cmd: &str, success: bool, output: &str, duration: f64) {
     }
 }
 
-/// Claude Code style "● Bash(cmd)" block with limited output lines.
 pub fn print_bash_result(cmd: &str, output: &str, max_lines: usize) {
     println!("{CYAN}  ● Bash({cmd}){RESET}");
     let non_empty: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -64,7 +63,6 @@ pub fn print_bash_result(cmd: &str, output: &str, max_lines: usize) {
     }
 }
 
-/// Show a set-based line diff for the given file. Returns (added, removed) counts.
 pub fn print_code_diff(filename: &str, old_content: &str, new_content: &str) -> (usize, usize) {
     let old_lines: Vec<&str> = old_content.lines().collect();
     let new_lines: Vec<&str> = new_content.lines().collect();
@@ -98,7 +96,6 @@ pub fn print_code_diff(filename: &str, old_content: &str, new_content: &str) -> 
     (added_count, removed_count)
 }
 
-/// Print a deduped list of all files modified during this session.
 pub fn print_change_summary(files: &[String]) {
     let mut seen = HashSet::new();
     let unique: Vec<&str> = files.iter()
@@ -121,6 +118,8 @@ pub enum SpinnerState {
     Fixing,
     FixingDsr1,
     Mistaking,
+    Reviewing,
+    Architecting,
 }
 
 impl SpinnerState {
@@ -133,6 +132,8 @@ impl SpinnerState {
             SpinnerState::Fixing => "Fixing...",
             SpinnerState::FixingDsr1 => "Deliberating...",
             SpinnerState::Mistaking => "Mistaking...",
+            SpinnerState::Reviewing => "Reviewing...",
+            SpinnerState::Architecting => "Architecting...",
         }
     }
 
@@ -140,11 +141,12 @@ impl SpinnerState {
         match self {
             SpinnerState::Thinking
             | SpinnerState::ThinkingMore
-            | SpinnerState::AlmostFinished => ORANGE,
+            | SpinnerState::AlmostFinished
+            | SpinnerState::Architecting => ORANGE,
             SpinnerState::Crafting => GREEN,
-            SpinnerState::Fixing => RED,
-            SpinnerState::FixingDsr1 => RED,
+            SpinnerState::Fixing | SpinnerState::FixingDsr1 => RED,
             SpinnerState::Mistaking => GRAY,
+            SpinnerState::Reviewing => CYAN,
         }
     }
 }

@@ -6,17 +6,21 @@ use crate::rules::RulesManager;
 use crate::state::AppState;
 use anyhow::Result;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use chrono;
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const QWEN: &str = "qwen2.5-coder:7b";
 const DSR1: &str = "deepseek-r1:8b";
-const QWEN_MAX_RETRIES: u32 = 5;
-const DSR1_MAX_RETRIES: u32 = 10;
+const REVIEW_MAX_ATTEMPTS: usize = 3;
+const ARCH_MAX_ITERATIONS: usize = 2;
+const CARGO_FIX_MAX: usize = 5;
+
+// ── Model option presets ──────────────────────────────────────────────────────
 
 fn dsr1_opts() -> ModelOptions {
     ModelOptions {
@@ -53,21 +57,21 @@ fn qwen_gen_opts() -> ModelOptions {
     }
 }
 
+// ── Data structures ───────────────────────────────────────────────────────────
+
 #[derive(Debug, Deserialize, Default)]
 struct AnalysisResponse {
     #[serde(default)]
     understanding: String,
     #[serde(default)]
+    task_type: String,
+    #[serde(default)]
     complexity: u8,
-    #[serde(default = "default_code_mod")]
-    code_modification: bool,
     #[serde(default)]
     gathered_info: Vec<GatheredInfo>,
     #[serde(default)]
     clarifications: Vec<Clarification>,
 }
-
-fn default_code_mod() -> bool { true }
 
 #[derive(Debug, Deserialize, Default)]
 struct GatheredInfo {
@@ -96,11 +100,25 @@ struct PlanStep {
     id: u32,
     name: String,
     #[serde(default)]
-    description: String,
+    submodule_prompt: String,
+    #[serde(default = "default_model")]
+    assigned_model: String,
     #[serde(default)]
     files_to_create: Vec<String>,
     #[serde(default)]
     verification: String,
+}
+
+fn default_model() -> String { "QWEN".to_string() }
+
+// ── Utility helpers ───────────────────────────────────────────────────────────
+
+fn resolve_model(assigned: &str) -> &'static str {
+    if assigned.to_uppercase().contains("DSR") || assigned.to_uppercase().contains("DEEP") {
+        DSR1
+    } else {
+        QWEN
+    }
 }
 
 fn list_files_in(dir: &Path) -> Vec<String> {
@@ -109,9 +127,7 @@ fn list_files_in(dir: &Path) -> Vec<String> {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().into_string().unwrap_or_default();
-            if name.starts_with('.') || name == "target" {
-                continue;
-            }
+            if name.starts_with('.') || name == "target" { continue; }
             if path.is_file() {
                 files.push(name);
             } else if path.is_dir() {
@@ -162,10 +178,30 @@ fn extract_code_blocks(response: &str) -> Vec<(String, String, String)> {
     results
 }
 
-fn process_tool_calls(response: &str, work_dir: &Path) -> (String, String) {
+/// Extract the first complete `{…}` block from raw model output.
+fn parse_json_from_response(response: &str) -> Option<String> {
+    if let Some(start) = response.find('{') {
+        let sub = &response[start..];
+        let mut depth = 0i32;
+        let mut end = 0;
+        for (i, c) in sub.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => { depth -= 1; if depth == 0 { end = i + 1; break; } }
+                _ => {}
+            }
+        }
+        if end > 0 { return Some(sub[..end].to_string()); }
+    }
+    None
+}
+
+/// Process [SYSTEM:read_file path="..."] and [SYSTEM:list_files path="..."] tags in AI output.
+fn process_system_calls(response: &str, work_dir: &Path) -> (String, String) {
     let mut tool_results = String::new();
     let mut clean = response.to_string();
-    while let Some(start) = clean.find("[TOOL:read_file") {
+
+    while let Some(start) = clean.find("[SYSTEM:read_file") {
         if let Some(end) = clean[start..].find(']') {
             let tag = &clean[start..start + end + 1];
             let mut result = String::new();
@@ -184,7 +220,8 @@ fn process_tool_calls(response: &str, work_dir: &Path) -> (String, String) {
             clean = format!("{}{}", &clean[..start], &clean[start + end + 1..]);
         } else { break; }
     }
-    while let Some(start) = clean.find("[TOOL:list_files") {
+
+    while let Some(start) = clean.find("[SYSTEM:list_files") {
         if let Some(end) = clean[start..].find(']') {
             let tag = &clean[start..start + end + 1];
             let dir = if let Some(path_start) = tag.find("path=\"") {
@@ -198,24 +235,15 @@ fn process_tool_calls(response: &str, work_dir: &Path) -> (String, String) {
             clean = format!("{}{}", &clean[..start], &clean[start + end + 1..]);
         } else { break; }
     }
+
     (clean, tool_results)
 }
 
-fn parse_json_from_response(response: &str) -> Option<String> {
-    if let Some(start) = response.find('{') {
-        let sub = &response[start..];
-        let mut depth = 0i32;
-        let mut end = 0;
-        for (i, c) in sub.char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => { depth -= 1; if depth == 0 { end = i + 1; break; } }
-                _ => {}
-            }
-        }
-        if end > 0 { return Some(sub[..end].to_string()); }
+fn record_usage(state: &Arc<Mutex<AppState>>, usage: &crate::ollama::UsageStats) {
+    if let Ok(mut st) = state.lock() {
+        st.usage.add(usage);
+        let _ = st.save_usage();
     }
-    None
 }
 
 fn gather_existing_code(work_dir: &Path, files: &[String]) -> String {
@@ -228,71 +256,76 @@ fn gather_existing_code(work_dir: &Path, files: &[String]) -> String {
             }
         }
     }
-    let cargo = work_dir.join("Cargo.toml");
-    if cargo.exists() {
-        if let Ok(content) = fs::read_to_string(&cargo) {
-            if !result.contains("Cargo.toml") {
-                result.push_str(&format!("=== Cargo.toml ===\n{}\n\n", content));
-            }
-        }
-    }
-    if result.is_empty() { result = "(empty project)".to_string(); }
+    if result.is_empty() { result = "(no existing files)".to_string(); }
     result
 }
 
-fn ensure_cargo_toml(work_dir: &Path) -> bool {
+fn ensure_cargo_toml(work_dir: &Path) {
     let cargo = work_dir.join("Cargo.toml");
     if !cargo.exists() {
-        let content = r#"[package]
-name = "project"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-"#;
-        let _ = fs::write(&cargo, content);
+        let _ = fs::write(&cargo, "[package]\nname = \"project\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n");
         println!("{GREEN}📦 已自动创建 Cargo.toml{RESET}");
-        return true;
-    }
-    false
-}
-
-fn record_usage(state: &Arc<Mutex<AppState>>, usage: &crate::ollama::UsageStats) {
-    if let Ok(mut st) = state.lock() {
-        st.usage.add(usage);
-        let _ = st.save_usage();
     }
 }
 
-fn get_output_language(state: &Arc<Mutex<AppState>>) -> String {
-    let st = state.lock().unwrap();
-    if st.lang == "zh_TW" { "Traditional Chinese (繁體中文)".to_string() }
-    else { "English".to_string() }
+/// Write code blocks to disk, updating the written_files map and printing diffs.
+fn write_step_files(
+    blocks: &[(String, String, String)],
+    work_dir: &Path,
+    written_files: &mut HashMap<String, String>,
+    all_completed: &mut Vec<String>,
+) {
+    for (_, filename, code) in blocks {
+        if filename.is_empty() { continue; }
+        let fpath = work_dir.join(filename);
+        let old_content = fs::read_to_string(&fpath).unwrap_or_default();
+        if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
+        let _ = fs::write(&fpath, code);
+        print_code_diff(filename, &old_content, code);
+        written_files.insert(filename.clone(), code.clone());
+        all_completed.push(filename.clone());
+    }
 }
 
-fn create_sandbox(work_dir: &Path) -> Result<PathBuf> {
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let sandbox = work_dir.join(".sakichan").join("sandboxes").join(&timestamp);
-    fs::create_dir_all(&sandbox)?;
-    Ok(sandbox)
+/// Build a formatted string of all written files for context.
+fn build_code_context(written_files: &HashMap<String, String>) -> String {
+    if written_files.is_empty() { return "(no files generated yet)".to_string(); }
+    let mut result = String::new();
+    let mut sorted: Vec<_> = written_files.iter().collect();
+    sorted.sort_by_key(|(k, _)| k.as_str());
+    for (filename, content) in sorted {
+        result.push_str(&format!("=== {} ===\n{}\n\n", filename, content));
+    }
+    result
 }
 
-fn git_checkpoint(executor: &Executor, description: &str) -> String {
-    let _ = executor.run("git add -A");
-    let safe_desc: String = description.chars()
-        .map(|c| if c == '"' || c == '\\' { '-' } else { c })
+/// Fixed git checkpoint using Command directly (avoids shell quoting bugs).
+fn git_checkpoint(work_dir: &Path, description: &str) -> String {
+    let _ = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(work_dir)
+        .output();
+
+    let safe: String = description.chars()
+        .map(|c| if c == '"' || c == '\'' || c == '\\' { '-' } else { c })
         .collect();
-    let msg = format!("sakichan: checkpoint before '{safe_desc}'");
-    let cmd = format!("git commit -m \"{msg}\" --allow-empty 2>&1");
-    match executor.run(&cmd) {
-        Ok((true, _, _)) => format!("Created checkpoint: {msg}"),
-        Ok((false, output, _)) => {
-            let err = output.lines().next().unwrap_or("git error").trim().to_string();
-            format!("Git: {err}")
+    let msg = format!("sakichan: checkpoint - {safe}");
+
+    match Command::new("git")
+        .args(["commit", "-m", &msg, "--allow-empty"])
+        .current_dir(work_dir)
+        .output()
+    {
+        Ok(o) if o.status.success() => format!("Created: {msg}"),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            format!("Git: {}", err.lines().next().unwrap_or("error").trim())
         }
         Err(e) => format!("Error: {e}"),
     }
 }
+
+// ── Phase 0: Context gathering ────────────────────────────────────────────────
 
 fn gather_context(
     ollama: &OllamaClient,
@@ -300,17 +333,22 @@ fn gather_context(
     files_str: &str,
     work_dir: &Path,
 ) -> String {
-    const FILE_EXTS: &[&str] = &[".md", ".rs", ".toml", ".txt", ".json", ".yaml", ".yml", ".py", ".js", ".ts", ".lock"];
+    const FILE_EXTS: &[&str] = &[
+        ".md", ".rs", ".toml", ".txt", ".json", ".yaml", ".yml",
+        ".py", ".js", ".ts", ".cpp", ".c", ".h", ".lock",
+    ];
     if !FILE_EXTS.iter().any(|ext| user_request.contains(ext)) {
         return user_request.to_string();
     }
 
     let prompt = format!(
-        "Extract file names/paths explicitly mentioned in this user request. Return ONLY a JSON array of strings. If none, return [].\n\nUser request: {user_request}\nAvailable files: {files_str}\n\nReturn ONLY like: [\"src/main.rs\", \"Cargo.toml\"]"
+        "Extract file names/paths explicitly mentioned in this user request. \
+Return ONLY a JSON array of strings. If none, return [].\n\n\
+User request: {user_request}\nAvailable files: {files_str}\n\n\
+Return ONLY like: [\"src/main.rs\", \"Cargo.toml\"]"
     );
 
-    let opts = qwen_ctx_opts();
-    let Ok((response, _)) = ollama.chat(QWEN, &prompt, Some(&opts)) else {
+    let Ok((response, _)) = ollama.chat(QWEN, &prompt, Some(&qwen_ctx_opts())) else {
         return user_request.to_string();
     };
 
@@ -319,9 +357,7 @@ fn gather_context(
         .and_then(|slice| serde_json::from_str(slice).ok())
         .unwrap_or_default();
 
-    if files.is_empty() {
-        return user_request.to_string();
-    }
+    if files.is_empty() { return user_request.to_string(); }
 
     let mut file_contents = String::new();
     for filename in &files {
@@ -333,12 +369,145 @@ fn gather_context(
         }
     }
 
-    if file_contents.is_empty() {
-        return user_request.to_string();
-    }
+    if file_contents.is_empty() { return user_request.to_string(); }
 
     format!("用户需求: {user_request}\n\n相关文件内容:{file_contents}")
 }
+
+// ── Review helpers ────────────────────────────────────────────────────────────
+
+fn review_has_warnings(review: &str) -> bool {
+    review.contains('⚠')
+}
+
+fn arch_has_issues(arch: &str) -> bool {
+    arch.contains("[MINOR]") || arch.contains("[MAJOR]")
+}
+
+fn build_review_prompt(step: &PlanStep, written_files: &HashMap<String, String>) -> String {
+    let code_ctx = {
+        let mut s = String::new();
+        for f in &step.files_to_create {
+            if let Some(content) = written_files.get(f) {
+                s.push_str(&format!("=== {} ===\n{}\n\n", f, content));
+            }
+        }
+        if s.is_empty() { build_code_context(written_files) } else { s }
+    };
+
+    format!(
+        r#"你是代码审查员。请检查以下代码是否存在问题。
+
+检查清单：
+1. 拼写错误、语法错误、缺少分号/括号等会导致编译失败的问题
+2. 函数签名、类型、模块引用是否正确
+3. 是否实现了子模块 prompt 中规定的所有输入输出
+4. 与接口规范是否一致
+5. 是否有明显的逻辑漏洞（如未处理的 None/Error）
+
+子模块要求：
+{submodule_prompt}
+
+代码：
+{code_ctx}
+
+用 [REVIEW] 开头，逐条列出检查结果。格式：
+[REVIEW] filename
+✓ 检查项描述
+⚠ 发现问题：具体描述"#,
+        submodule_prompt = step.submodule_prompt,
+        code_ctx = code_ctx,
+    )
+}
+
+fn build_fix_prompt(
+    step: &PlanStep,
+    written_files: &HashMap<String, String>,
+    review: &str,
+    output_lang: &str,
+) -> String {
+    let code_ctx = build_code_context(written_files);
+    format!(
+        r#"## Environment
+- OS: Windows 11
+- Shell: PowerShell
+
+审查意见如下，请修复所有标记了 ⚠ 的问题。
+
+审查结果：
+{review}
+
+子模块要求：
+{submodule_prompt}
+
+当前代码：
+{code_ctx}
+
+请输出修复后的完整代码，格式：
+```rust filename="path/to/file.rs"
+// full corrected code
+```
+所有注释和说明用 {output_lang}。"#,
+        submodule_prompt = step.submodule_prompt,
+    )
+}
+
+fn build_architect_prompt(user_request: &str, plan_summary: &str, all_code: &str) -> String {
+    format!(
+        r#"你是架构师。请检查以下模块是否组装正确。
+
+原始需求：{user_request}
+
+规划方案：
+{plan_summary}
+
+各模块代码：
+{all_code}
+
+检查：
+1. 各模块间的接口是否匹配（A 的输出类型 = B 的输入类型）
+2. 数据流是否完整（从入口到出口）
+3. 是否有多余模块或缺失模块
+4. 整体是否符合规划
+
+用 [ARCHITECT] 开头，逐条列出。如有问题，标注严重程度：
+- [MINOR] 可追加修正指令修复
+- [MAJOR] 需要重新生成该模块
+
+如果一切正常，输出：[ARCHITECT] ✓ 所有模块接口匹配，架构检查通过。"#
+    )
+}
+
+fn build_rework_prompt(
+    user_request: &str,
+    arch_feedback: &str,
+    all_code: &str,
+    output_lang: &str,
+) -> String {
+    format!(
+        r#"## Environment
+- OS: Windows 11
+- Shell: PowerShell
+
+架构师发现以下问题，请修复所有受影响的代码。
+
+原始需求：{user_request}
+
+架构师意见：
+{arch_feedback}
+
+当前代码：
+{all_code}
+
+对每个需要修改的文件输出完整修复后的代码，格式：
+```rust filename="path/to/file.rs"
+// full corrected code
+```
+所有注释和说明用 {output_lang}。"#
+    )
+}
+
+// ── Main orchestrator ─────────────────────────────────────────────────────────
 
 pub fn run_orchestrator(
     state: &Arc<Mutex<AppState>>,
@@ -347,33 +516,38 @@ pub fn run_orchestrator(
 ) -> Result<()> {
     let run_start = Instant::now();
 
-    let (host, model, work_dir, edit_mode, output_lang) = {
+    let (host, work_dir, edit_mode, output_lang) = {
         let st = state.lock().unwrap();
-        (st.ollama_host.clone(), st.current_model.clone(), st.work_dir.clone(), st.edit_mode,
-         if st.lang == "zh_TW" { "Traditional Chinese (繁體中文)".to_string() } else { "English".to_string() })
+        (
+            st.ollama_host.clone(),
+            st.work_dir.clone(),
+            st.edit_mode,
+            if st.lang == "zh_TW" {
+                "Traditional Chinese (繁體中文)".to_string()
+            } else {
+                "English".to_string()
+            },
+        )
     };
 
     let ollama = OllamaClient::new(&host);
     let executor = Executor::new(work_dir.clone());
     let rules_mgr = RulesManager::new(work_dir.join(".sakichan.md"));
-    let logger = Logger::new(
-        work_dir.join(".sakichan").join("build.log"),
-        work_dir.file_name().unwrap_or_default().to_string_lossy().to_string(),
-    );
+    let logger = Logger::from_work_dir(&work_dir);
     let _ = logger.init();
 
     let rules = rules_mgr.load();
     let existing_files = list_files_in(&work_dir);
     let files_str = existing_files.join(", ");
 
-    // ══════════════════════════════════════════════════════════════════
-    // Phase 0: Context Gathering
-    // ══════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════
+    // Phase 0: Context Gathering  (qwen, temperature=0.1)
+    // ════════════════════════════════════════════════════════════════════
     let enriched_request = gather_context(&ollama, user_request, &files_str, &work_dir);
 
-    // ══════════════════════════════════════════════════════════════════
-    // Phase 1: Analysis
-    // ══════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════
+    // Phase 1: Analysis  (dsr1, temperature=0.3)
+    // ════════════════════════════════════════════════════════════════════
     println!("{CYAN}🔍 分析需求中... / Analyzing...{RESET}");
 
     let prompt_a = format!(
@@ -383,410 +557,467 @@ pub fn run_orchestrator(
 - Commands use PowerShell syntax (e.g., dir not ls, ; not &&)
 - Path separator: \
 
-You are an expert software engineer analyzing a user request.
+You are an expert analyzing a user request. Output your analysis in {lang}.
 
-IMPORTANT RULES:
-1. If the user says any of these: "不要修改代码", "只输出分析", "只分析不修改", "analyze only", "no modifications", "do not modify", "只讀", "只读" — this is an ANALYSIS-ONLY request. You MUST set "code_modification": false.
-2. If the user wants to CREATE, BUILD, WRITE code, or IMPLEMENT features, set "code_modification": true.
-3. When code_modification is false, NO files should be changed.
-
-Work directory: {}
-Existing files: {}
+Work directory: {work_dir}
+Existing files: {files_str}
 Project rules:
-{}
+{rules}
 
-User request: {}
+User request:
+{request}
 
+Available tools (include in response if you need to inspect files):
+- [SYSTEM:read_file path="relative/path"]
+- [SYSTEM:list_files path="dir"]
 
-Available tools:
-- [TOOL:read_file path="relative/path"]
-- [TOOL:list_files path="dir"]
+Based on the request, output ONLY valid JSON:
+{{"understanding":"brief understanding in {lang}","task_type":"natural language description of task type (e.g. '修改现有Rust代码', '生成学术论文', '代码分析解读', '跨语言翻译')","complexity":5,"gathered_info":[{{"label":"目标","value":"...","source":"需求推断"}}],"clarifications":[{{"question":"q","recommendation":"suggestion"}}]}}
 
-Based on ALL information gathered (user request, file contents, project rules, existing code),
-identify what is GENUINELY unclear.
-
-Only list clarifications that meet ALL criteria:
-1. Answer significantly changes implementation direction
-2. Cannot be inferred from existing context
-3. Multiple reasonable approaches exist
-
-Do NOT ask about things you can read from files.
-Do NOT ask "what should I focus on" or "any specific requirements".
-If everything is clear, return empty clarifications array.
-
-Respond with ONLY valid JSON:
-{{"understanding":"brief in {lang}","complexity":5,"code_modification":true,"gathered_info":[{{"label":"目标平台","value":"Windows","source":"环境推断"}}],"clarifications":[{{"question":"q","recommendation":"suggestion"}}]}}
-Complexity is 1-10. All explanation text in {lang}."#,
-        work_dir.display(), files_str, rules, enriched_request,
-        lang = output_lang
+Rules:
+- task_type is free-form natural language, NOT an enum
+- complexity is 1-10
+- clarifications must be empty [] if everything is clear; max 3 items
+- Only ask clarifications that GENUINELY change the implementation direction
+- All text in {lang}"#,
+        lang = output_lang,
+        work_dir = work_dir.display(),
+        request = enriched_request,
     );
 
     let spinner = Spinner::new(SpinnerState::Thinking);
-    let a_opts = dsr1_opts();
-    let (analysis_raw, usage_a) = ollama.chat(DSR1, &prompt_a, Some(&a_opts))?;
+    let (analysis_raw, usage_a) = ollama.chat(DSR1, &prompt_a, Some(&dsr1_opts()))?;
     spinner.update_tokens(usage_a.input_tokens + usage_a.output_tokens);
     spinner.stop();
     record_usage(state, &usage_a);
 
-    let (analysis_clean, tool_results_a) = process_tool_calls(&analysis_raw, &work_dir);
-    let analysis_text = if tool_results_a.is_empty() { analysis_clean } else { format!("{analysis_clean}\n{tool_results_a}") };
+    let (analysis_clean, tool_results_a) = process_system_calls(&analysis_raw, &work_dir);
+    let analysis_text = if tool_results_a.is_empty() {
+        analysis_clean
+    } else {
+        format!("{analysis_clean}\n{tool_results_a}")
+    };
 
     let analysis: AnalysisResponse = parse_json_from_response(&analysis_text)
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
 
     println!("{CYAN}📊 复杂度 / Complexity: {}/10{RESET}", analysis.complexity);
+    if !analysis.task_type.is_empty() {
+        println!("{GRAY}任务类型 / Task type: {}{RESET}", analysis.task_type);
+    }
     if !analysis.understanding.is_empty() {
         println!("{GRAY}理解: {}{RESET}", analysis.understanding);
     }
 
-    let mut current_model = model.clone();
-    if analysis.complexity >= 7 {
-        current_model = DSR1.to_string();
-        println!("{YELLOW}复杂度高，切换模型到 {current_model}{RESET}");
-        state.lock().unwrap().current_model = current_model.clone();
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // Phase 2: Clarification
-    // ══════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════
+    // Phase 2: Clarification  (interactive, max 3 questions)
+    // ════════════════════════════════════════════════════════════════════
     if !analysis.gathered_info.is_empty() {
         println!("{CYAN}📋 已获取的信息:{RESET}");
         for info in &analysis.gathered_info {
-            println!("  {GREEN}✓{RESET} {}: {} {GRAY}({}){RESET}", info.label, info.value, info.source);
+            println!(
+                "  {GREEN}✓{RESET} {}: {} {GRAY}({}){RESET}",
+                info.label, info.value, info.source
+            );
         }
         println!();
     }
 
-    const MAX_INLINE_QUESTIONS: usize = 2;
+    const MAX_INLINE_QUESTIONS: usize = 3;
     let mut decisions = Vec::new();
+
     if !analysis.clarifications.is_empty() {
         let total = analysis.clarifications.len();
         for (i, c) in analysis.clarifications.iter().enumerate() {
             if i >= MAX_INLINE_QUESTIONS {
-                let decision = c.recommendation.clone();
-                decisions.push(format!("Q: {} → A: {} (auto)", c.question, decision));
+                decisions.push(format!("Q: {} → A: {} (auto)", c.question, c.recommendation));
                 continue;
             }
             println!();
-            print!("{YELLOW}❓ [{}/{}] {} {GRAY}[推荐: {}]{YELLOW}: {RESET}",
-                i + 1, total.min(MAX_INLINE_QUESTIONS),
-                c.question, c.recommendation);
+            print!(
+                "{YELLOW}❓ [{}/{}] {} {GRAY}[推荐: {}]{YELLOW}: {RESET}",
+                i + 1,
+                total.min(MAX_INLINE_QUESTIONS),
+                c.question,
+                c.recommendation
+            );
             let _ = io::stdout().flush();
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
             let input = input.trim();
-            let decision = if input.is_empty() { c.recommendation.clone() } else { input.to_string() };
+            let decision = if input.is_empty() {
+                c.recommendation.clone()
+            } else {
+                input.to_string()
+            };
             decisions.push(format!("Q: {} → A: {}", c.question, decision));
         }
+        println!("{CYAN}🔒 进入自动模式{RESET}");
     } else {
-        println!("{GREEN}✅ 信息充分，无需澄清，直接进入规划{RESET}");
+        println!("{GREEN}✅ 信息充分，进入规划{RESET}");
     }
 
-    // 如果是纯分析模式，输出分析结果后直接返回
-    if !analysis.code_modification {
-        println!();
-        println!("{CYAN}📝 纯分析模式 — 不修改任何文件{RESET}");
-        println!("{GRAY}分析结果:{RESET}");
-        println!("  {GRAY}理解: {}{RESET}", analysis.understanding);
-        println!("  {GRAY}复杂度: {}/10{RESET}", analysis.complexity);
-        if !decisions.is_empty() {
-            println!("  {GRAY}决策:{RESET}");
-            for d in &decisions {
-                println!("    {GRAY}{d}{RESET}");
-            }
-        }
-        println!();
-        println!("{YELLOW}💡 提示: 若需要修改代码，请输入具体需求；若只需分析，以上即为结果。{RESET}");
-        return Ok(());
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // Phase 3: Planning
-    // ══════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════
+    // Phase 3: Planning  (dsr1, temperature=0.3)
+    // ════════════════════════════════════════════════════════════════════
     println!();
     println!("{CYAN}📋 规划步骤中... / Planning...{RESET}");
 
-    let decisions_str = if decisions.is_empty() { "None".to_string() } else { decisions.join("\n") };
+    let decisions_str = if decisions.is_empty() {
+        "None".to_string()
+    } else {
+        decisions.join("\n")
+    };
 
     let prompt_p = format!(
         r#"## Environment
 - OS: Windows 11
 - Shell: PowerShell
-- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)
-- Path separator: \
 
-You are planning implementation steps.
+You are planning implementation steps. Output in {lang}.
 
-User request: {}
-Understanding: {}
-Decisions: {}
-Rules: {}
-Existing files: {}
+User request: {request}
+Task type: {task_type}
+Understanding: {understanding}
+Decisions made: {decisions}
+Project rules: {rules}
+Existing files: {files_str}
 
-IMPORTANT: If no Cargo.toml exists, the first step MUST create it.
-Step names MUST start with a verb and describe the action concisely. Good: 'Implement Fibonacci function'. Bad: 'Fibonacci function'.
+Output ONLY valid JSON with this schema:
+{{"steps":[{{"id":1,"name":"动词开头的步骤名","submodule_prompt":"完整独立prompt，包含：职责、输入接口、输出规范、不负责的范围。执行模型无需其他上下文即可完成工作。","assigned_model":"QWEN","files_to_create":["path/to/file.rs"],"verification":"如何验证"}}]}}
 
-Respond with ONLY JSON (all explanation text in {}):
-{{"steps":[{{"id":1,"name":"step","description":"detail","files_to_create":["path.rs"],"verification":"cargo check"}}]}}"#,
-        user_request, analysis.understanding, decisions_str, rules, files_str, output_lang
+Rules:
+- submodule_prompt MUST be self-contained; orchestrator will prepend project background
+- assigned_model is "QWEN" (for straightforward tasks) or "DSR1" (for complex logic/architecture)
+- step names MUST start with a verb (e.g. "实现 Fibonacci 函数", not "Fibonacci 函数")
+- If task has no code to write (analysis, essay, etc.), steps should create output files
+- All text in {lang}"#,
+        lang = output_lang,
+        request = user_request,
+        task_type = analysis.task_type,
+        understanding = analysis.understanding,
+        decisions = decisions_str,
     );
 
     let spinner = Spinner::new(SpinnerState::Thinking);
-    let p_opts = dsr1_opts();
-    let (plan_raw, usage_p) = ollama.chat(DSR1, &prompt_p, Some(&p_opts))?;
+    let (plan_raw, usage_p) = ollama.chat(DSR1, &prompt_p, Some(&dsr1_opts()))?;
     spinner.update_tokens(usage_p.input_tokens + usage_p.output_tokens);
     spinner.stop();
     record_usage(state, &usage_p);
 
-    let (plan_clean, _) = process_tool_calls(&plan_raw, &work_dir);
-
-    let plan: PlanResponse = parse_json_from_response(&plan_clean)
+    let plan: PlanResponse = parse_json_from_response(&plan_raw)
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or(PlanResponse {
             steps: vec![PlanStep {
-                id: 1, name: "Generate code".to_string(),
-                description: user_request.to_string(),
-                files_to_create: vec!["Cargo.toml".to_string(), "src/main.rs".to_string()],
-                verification: "cargo check".to_string(),
+                id: 1,
+                name: "生成代码".to_string(),
+                submodule_prompt: user_request.to_string(),
+                assigned_model: "QWEN".to_string(),
+                files_to_create: vec!["src/main.rs".to_string()],
+                verification: "检查文件".to_string(),
             }],
         });
 
     println!("{CYAN}步骤 / Steps:{RESET}");
     for step in &plan.steps {
-        println!("  {GREEN}{}. {}{RESET}", step.id, step.name);
+        println!(
+            "  {GREEN}{}. {} {GRAY}[{}]{RESET}",
+            step.id, step.name, step.assigned_model
+        );
     }
     println!();
 
-    // ══════════════════════════════════════════════════════════════════
-    // Phase 4: Execute Steps
-    // ══════════════════════════════════════════════════════════════════
-    let mut all_completed_files: Vec<String> = Vec::new();
-    let step_count = plan.steps.len();
-    let mut any_step_failed = false;
+    // Read-only: stop here
+    if !edit_mode {
+        println!("{YELLOW}⚠️  只读模式，跳过代码生成 / Read-only mode — use /edit to enable{RESET}");
+        return Ok(());
+    }
 
-    // 3a: Create sandbox before executing any steps
-    let sandbox_path: Option<PathBuf> = if edit_mode {
-        match create_sandbox(&work_dir) {
-            Ok(path) => {
-                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                println!("{CYAN}  ● Sandbox(create){RESET}");
-                println!("  {GRAY}⎿  Created: .sakichan/sandboxes/{name}{RESET}");
-                Some(path)
-            }
-            Err(e) => {
-                println!("{YELLOW}⚠ 沙箱创建失败 / Sandbox creation failed: {e}{RESET}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // ════════════════════════════════════════════════════════════════════
+    // Phase 4: Execution
+    // ════════════════════════════════════════════════════════════════════
+
+    // Git checkpoint — one per session, before any writes
+    let checkpoint_info = git_checkpoint(&work_dir, user_request);
+    state.lock().unwrap().checkpoint_count += 1;
+    println!("{CYAN}  ● Git(checkpoint){RESET}");
+    println!("  {GRAY}⎿  {checkpoint_info}{RESET}");
+    println!();
+
+    // Auto-create Cargo.toml if this appears to be a Rust project
+    let is_rust = plan.steps.iter()
+        .flat_map(|s| s.files_to_create.iter())
+        .any(|f| f.ends_with(".rs"));
+    if is_rust { ensure_cargo_toml(&work_dir); }
+
+    let mut written_files: HashMap<String, String> = HashMap::new();
+    let mut all_completed: Vec<String> = Vec::new();
+    let step_count = plan.steps.len();
+
+    // ── 4a + 4b: Generate each step, then review ─────────────────────
 
     for (step_idx, step) in plan.steps.iter().enumerate() {
         println!("{PINK}● {}/{}: {}{RESET}", step_idx + 1, step_count, step.name);
 
-        if !edit_mode {
-            println!("{YELLOW}⚠️  只读模式，跳过文件写入{RESET}");
-            continue;
-        }
+        let exec_model = resolve_model(&step.assigned_model);
+        let exec_opts = if exec_model == QWEN { qwen_gen_opts() } else { dsr1_opts() };
 
-        let checkpoint_info = git_checkpoint(&executor, &step.name);
-        state.lock().unwrap().checkpoint_count += 1;
-        println!("{CYAN}  ● Git(checkpoint){RESET}");
-        println!("  {GRAY}⎿  {checkpoint_info}{RESET}");
+        // Pull in any files this step needs from disk (from prior steps)
+        let prior_code = gather_existing_code(&work_dir, &step.files_to_create);
 
-        let _ = ensure_cargo_toml(&work_dir);
-        let existing_code = gather_existing_code(&work_dir, &step.files_to_create);
-
-        let base_prompt = format!(
+        let gen_prompt = format!(
             r#"## Environment
 - OS: Windows 11
 - Shell: PowerShell
 - Commands use PowerShell syntax (e.g., dir not ls, ; not &&)
 - Path separator: \
 
-Implement step {step_id} of a software project.
-
 Project: {request}
-Step: {name} - {desc}
-Files: {files}
-Verification: {verify}
+Task type: {task_type}
 
-Existing code:
-{code}
+Existing relevant code:
+{prior_code}
 
-Generate COMPLETE code. Format:
+Your submodule task:
+{submodule_prompt}
+
+Target files: {files}
+
+Generate COMPLETE, compilable code for each file. Format every file as:
 ```rust filename="path/to/file.rs"
-// full code
+// full code here
 ```
-Write FULL compilable code. All explanation in {lang}."#,
-            step_id = step.id, request = user_request, name = step.name,
-            desc = step.description, files = step.files_to_create.join(", "),
-            verify = step.verification, code = existing_code, lang = output_lang,
+All comments and text in {lang}."#,
+            request = user_request,
+            task_type = analysis.task_type,
+            submodule_prompt = step.submodule_prompt,
+            files = step.files_to_create.join(", "),
+            lang = output_lang,
         );
 
-        let mut compile_ok = false;
-        let step_start = Instant::now();
-        let mut step_model = current_model.clone();
-        let mut prompt_c = base_prompt.clone();
-    
-        // ── Qwen (max 5) ──
-        for attempt in 1..=QWEN_MAX_RETRIES {
-            let spinner_state = if attempt == 1 { SpinnerState::Crafting } else { SpinnerState::Fixing };
-            let spinner = Spinner::new(spinner_state);
-            let exec_opts = if step_model == QWEN { qwen_gen_opts() } else { dsr1_opts() };
-            let (code_raw, usage_c) = ollama.chat(&step_model, &prompt_c, Some(&exec_opts))?;
-            spinner.update_tokens(usage_c.input_tokens + usage_c.output_tokens);
+        // 4a: Generate
+        let spinner = Spinner::new(SpinnerState::Crafting);
+        let (code_raw, usage_c) = ollama.chat(exec_model, &gen_prompt, Some(&exec_opts))?;
+        spinner.update_tokens(usage_c.input_tokens + usage_c.output_tokens);
+        spinner.stop();
+        record_usage(state, &usage_c);
+
+        let blocks = extract_code_blocks(&code_raw);
+        if blocks.is_empty() {
+            println!("{YELLOW}  ⚠ No code blocks generated for step {}{RESET}", step.id);
+        } else {
+            write_step_files(&blocks, &work_dir, &mut written_files, &mut all_completed);
+        }
+
+        // 4b: Review loop (max REVIEW_MAX_ATTEMPTS)
+        let mut fix_prompt_extra = String::new();
+        for review_attempt in 1..=REVIEW_MAX_ATTEMPTS {
+            let review_prompt = build_review_prompt(step, &written_files);
+
+            let spinner = Spinner::new(SpinnerState::Reviewing);
+            let (review_raw, usage_r) = ollama.chat(QWEN, &review_prompt, Some(&qwen_ctx_opts()))?;
+            spinner.update_tokens(usage_r.input_tokens + usage_r.output_tokens);
             spinner.stop();
-            record_usage(state, &usage_c);
-    
-            let (code_clean, tool_results) = process_tool_calls(&code_raw, &work_dir);
-            if !tool_results.is_empty() { prompt_c.push_str(&format!("\n\n{tool_results}")); }
-    
-            let blocks = extract_code_blocks(&code_clean);
-            if blocks.is_empty() {
-                if attempt < QWEN_MAX_RETRIES {
-                    prompt_c.push_str("\n\nERROR: No code blocks. Use ```rust filename=\"path\" format.");
-                    continue;
-                }
+            record_usage(state, &usage_r);
+
+            // Show condensed review output
+            print!("{CYAN}  [Review {review_attempt}/{REVIEW_MAX_ATTEMPTS}]{RESET} ");
+            if !review_has_warnings(&review_raw) {
+                println!("{GREEN}✓ passed{RESET}");
                 break;
             }
-    
-            for (_lang, filename, code) in &blocks {
-                if filename.is_empty() { continue; }
-                let fpath = work_dir.join(filename);
-                let old_content = fs::read_to_string(&fpath).unwrap_or_default();
-                if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
-                let _ = fs::write(&fpath, code);
-                print_code_diff(filename, &old_content, code);
-                all_completed_files.push(filename.clone());
+
+            println!("{YELLOW}⚠ issues found{RESET}");
+            // Show first warning line
+            for line in review_raw.lines().filter(|l| l.contains('⚠')).take(3) {
+                println!("    {YELLOW}{}{RESET}", line.trim());
             }
 
-            let (ok, output, _dur) = executor.run("cargo check 2>&1")?;
+            if review_attempt == REVIEW_MAX_ATTEMPTS {
+                println!("  {YELLOW}⚠ Max reviews reached, proceeding anyway{RESET}");
+                break;
+            }
+
+            // Fix
+            fix_prompt_extra.push_str(&format!("\n\n[Review {}]\n{}", review_attempt, review_raw));
+            let fix_prompt = build_fix_prompt(step, &written_files, &review_raw, &output_lang);
+
+            let spinner = Spinner::new(SpinnerState::Fixing);
+            let (fixed_raw, usage_f) = ollama.chat(exec_model, &fix_prompt, Some(&exec_opts))?;
+            spinner.update_tokens(usage_f.input_tokens + usage_f.output_tokens);
+            spinner.stop();
+            record_usage(state, &usage_f);
+
+            let fix_blocks = extract_code_blocks(&fixed_raw);
+            if !fix_blocks.is_empty() {
+                write_step_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed);
+            }
+        }
+    }
+
+    // ── 4c + 4d: Architect check and rework ──────────────────────────
+
+    if !written_files.is_empty() {
+        let plan_summary = plan.steps.iter().map(|s| {
+            format!(
+                "Step {}: {}\n  Model: {}\n  Files: {}\n  Task: {}",
+                s.id, s.name, s.assigned_model,
+                s.files_to_create.join(", "),
+                s.submodule_prompt
+            )
+        }).collect::<Vec<_>>().join("\n\n");
+
+        for arch_iter in 1..=ARCH_MAX_ITERATIONS {
+            let all_code_ctx = build_code_context(&written_files);
+            let arch_prompt = build_architect_prompt(user_request, &plan_summary, &all_code_ctx);
+
+            println!("{CYAN}🏛️  架构师检查 / Architect check ({arch_iter}/{ARCH_MAX_ITERATIONS})...{RESET}");
+
+            let spinner = Spinner::new(SpinnerState::Architecting);
+            let (arch_raw, usage_arch) = ollama.chat(DSR1, &arch_prompt, Some(&dsr1_opts()))?;
+            spinner.update_tokens(usage_arch.input_tokens + usage_arch.output_tokens);
+            spinner.stop();
+            record_usage(state, &usage_arch);
+
+            // Show condensed architect output
+            for line in arch_raw.lines().take(8) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    println!("  {GRAY}{trimmed}{RESET}");
+                }
+            }
+
+            if !arch_has_issues(&arch_raw) {
+                println!("{GREEN}✓ 架构检查通过 / Architect check passed{RESET}");
+                break;
+            }
+
+            println!("{YELLOW}⚠ 架构师发现问题，进行返工 / Issues found, reworking...{RESET}");
+
+            if arch_iter == ARCH_MAX_ITERATIONS {
+                println!("{YELLOW}⚠ Max architect iterations reached, proceeding to compile check{RESET}");
+                break;
+            }
+
+            // 4d: Fix — let dsr1 fix all issues at once
+            let all_code_ctx = build_code_context(&written_files);
+            let rework_prompt = build_rework_prompt(user_request, &arch_raw, &all_code_ctx, &output_lang);
+
+            let spinner = Spinner::new(SpinnerState::FixingDsr1);
+            let (rework_raw, usage_rw) = ollama.chat(DSR1, &rework_prompt, Some(&dsr1_opts()))?;
+            spinner.update_tokens(usage_rw.input_tokens + usage_rw.output_tokens);
+            spinner.stop();
+            record_usage(state, &usage_rw);
+
+            let rework_blocks = extract_code_blocks(&rework_raw);
+            if !rework_blocks.is_empty() {
+                write_step_files(&rework_blocks, &work_dir, &mut written_files, &mut all_completed);
+            }
+        }
+    }
+
+    // ── 4e: Compilation gate (Rust projects only) ─────────────────────
+
+    let mut compile_ok = true;
+    if work_dir.join("Cargo.toml").exists() && !written_files.is_empty() {
+        println!();
+        println!("{CYAN}🔍 编译检查 / Cargo check...{RESET}");
+        compile_ok = false;
+
+        for attempt in 1..=CARGO_FIX_MAX {
+            let (ok, output, _) = executor.run("cargo check 2>&1")?;
 
             if ok {
                 print_bash_result("cargo check 2>&1", &output, 5);
-                println!("{GREEN}  ✓ 编译通过 (qwen, attempt {attempt}){RESET}");
+                println!("{GREEN}  ✓ 编译通过 (attempt {attempt}){RESET}");
                 compile_ok = true;
                 break;
-            } else {
-                let err: String = output.chars().take(1500).collect();
-                prompt_c = format!("## Environment\n- OS: Windows 11\n- Shell: PowerShell\n- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)\n- Path separator: \\\n\nCOMPILE ERROR:\n```\n{}\n```\n\nFix ALL files. ```rust filename=\"path\" format. All text in {}.\n\n{}", err, output_lang, base_prompt);
             }
-        }
 
-        // ── DSR1 fallback (max 10) ──
-        if !compile_ok {
-            step_model = DSR1.to_string();
-            println!("{RED}🔄 qwen 失败，切换到 deepseek-r1 (最多 10 次)...{RESET}");
-            prompt_c = format!("## Environment\n- OS: Windows 11\n- Shell: PowerShell\n- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)\n- Path separator: \\\n\nURGENT: Fix ALL compile errors. All text in {}.\n\n{}", output_lang, base_prompt);
-
-            for attempt in 1..=DSR1_MAX_RETRIES {
-                let spinner = Spinner::new(SpinnerState::FixingDsr1);
-                let fb_opts = dsr1_opts();
-                let (code_raw, usage_c) = ollama.chat(&step_model, &prompt_c, Some(&fb_opts))?;
-                spinner.update_tokens(usage_c.input_tokens + usage_c.output_tokens);
-                spinner.stop();
-                record_usage(state, &usage_c);
-
-                let (code_clean, tool_results) = process_tool_calls(&code_raw, &work_dir);
-                if !tool_results.is_empty() { prompt_c.push_str(&format!("\n\n{tool_results}")); }
-
-                let blocks = extract_code_blocks(&code_clean);
-                if blocks.is_empty() {
-                    if attempt < DSR1_MAX_RETRIES { continue; }
-                    break;
-                }
-
-                for (_lang, filename, code) in &blocks {
-                    if filename.is_empty() { continue; }
-                    let fpath = work_dir.join(filename);
-                    let old_content = fs::read_to_string(&fpath).unwrap_or_default();
-                    if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
-                    let _ = fs::write(&fpath, code);
-                    print_code_diff(filename, &old_content, code);
-                    all_completed_files.push(filename.clone());
-                }
-
-                let (ok, output, _dur) = executor.run("cargo check 2>&1")?;
-
-                if ok {
-                    print_bash_result("cargo check 2>&1", &output, 5);
-                    println!("{GREEN}  ✓ 编译通过 (dsr1, attempt {attempt}){RESET}");
-                    compile_ok = true;
-                    break;
-                } else {
-                    let err: String = output.chars().take(1500).collect();
-                    prompt_c = format!("## Environment\n- OS: Windows 11\n- Shell: PowerShell\n- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)\n- Path separator: \\\n\nCOMPILE ERROR:\n```\n{}\n```\n\nFix ALL files. ```rust filename=\"path\" format. All text in {}.\n\n{}", err, output_lang, base_prompt);
-                }
+            if attempt == CARGO_FIX_MAX {
+                println!("{RED}❌ 编译失败 after {CARGO_FIX_MAX} attempts{RESET}");
+                break;
             }
-        }
-    
-        let step_duration = step_start.elapsed().as_secs_f64();
-        let _ = logger.log_task(&step.name, &step.description, &all_completed_files, compile_ok, &[], &step_model, step_duration);
-    
-        if !compile_ok {
-            any_step_failed = true;
-            println!("{RED}❌ 编译失败 after {} attempts{RESET}", QWEN_MAX_RETRIES + DSR1_MAX_RETRIES);
-            // 3b: Rollback this step's changes via git
-            if let Ok((reverted, _, _)) = executor.run("git checkout -- .") {
-                if reverted {
-                    println!("{RED}  ● Sandbox(rollback){RESET}");
-                    println!("  {GRAY}⎿  Rolling back step {} after {} failed attempts{RESET}",
-                        step.id, QWEN_MAX_RETRIES + DSR1_MAX_RETRIES);
-                }
+
+            let err: String = output.chars().take(1500).collect();
+            println!("{RED}  ✗ 编译失败 (attempt {attempt}), 修复中...{RESET}");
+
+            let all_code_ctx = build_code_context(&written_files);
+            let cargo_fix_prompt = format!(
+                r#"## Environment
+- OS: Windows 11
+- Shell: PowerShell
+
+编译错误（尝试 {attempt}/{CARGO_FIX_MAX}）：
+```
+{err}
+```
+
+当前代码：
+{all_code_ctx}
+
+请修复所有编译错误，输出完整修复后的代码，格式：
+```rust filename="path/to/file.rs"
+// full corrected code
+```
+所有说明用 {output_lang}。"#
+            );
+
+            let spinner = Spinner::new(SpinnerState::FixingDsr1);
+            let (fix_raw, usage_fix) = ollama.chat(DSR1, &cargo_fix_prompt, Some(&dsr1_opts()))?;
+            spinner.update_tokens(usage_fix.input_tokens + usage_fix.output_tokens);
+            spinner.stop();
+            record_usage(state, &usage_fix);
+
+            let fix_blocks = extract_code_blocks(&fix_raw);
+            if !fix_blocks.is_empty() {
+                write_step_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed);
             }
         }
     }
-    
-    // ══════════════════════════════════════════════════════════════════
-    // Phase 5: Final Build
-    // ══════════════════════════════════════════════════════════════════
-    if edit_mode && !all_completed_files.is_empty() {
-        println!();
-        println!("{CYAN}🏗️  最终构建 / Final build...{RESET}");
-        let (ok, output, dur) = executor.run("cargo build --release 2>&1")?;
-        print_cmd_result("cargo build --release", ok, &output, dur);
-        if ok {
-            println!("{GREEN}🎉 构建完成！/ Build complete!{RESET}");
-        } else {
-            println!("{RED}构建失败，请检查错误 / Build failed{RESET}");
-        }
-    
-        let structure = list_files_in(&work_dir).join("\n");
-        let _ = rules_mgr.update(&all_completed_files, &structure);
-        println!("{GRAY}📄 规则文件已更新 / Rules updated{RESET}");
-        println!("{GRAY}📝 日志已更新 / Log updated{RESET}");
 
-        if ok {
-            print_change_summary(&all_completed_files);
-        }
+    // ════════════════════════════════════════════════════════════════════
+    // Phase 5: Wrap-up
+    // ════════════════════════════════════════════════════════════════════
+    println!();
+    print_change_summary(&all_completed);
 
-        let elapsed = run_start.elapsed().as_secs_f64();
-        let elapsed_str = if elapsed >= 60.0 {
-            format!("{}m {:.0}s", elapsed as u64 / 60, elapsed % 60.0)
-        } else {
-            format!("{:.1}s", elapsed)
-        };
-        println!("{PINK}✻ Baked for {elapsed_str}{RESET}");
-    }
+    let structure = list_files_in(&work_dir).join("\n");
+    let _ = rules_mgr.update(&all_completed, &structure);
+    println!("{GRAY}📄 规则文件已更新 / Rules updated{RESET}");
 
-    // 3c: Sandbox cleanup after Phase 5
-    if let Some(ref sandbox) = sandbox_path {
-        if any_step_failed {
-            println!("{YELLOW}⚠ 沙箱保留（有步骤失败），使用 /undo 可回滚 / Sandbox kept — use /undo to rollback{RESET}");
-        } else {
-            let _ = fs::remove_dir_all(sandbox);
-            println!("{GRAY}🧹 沙箱已清理 / Sandbox cleaned up{RESET}");
-        }
-    }
+    let elapsed = run_start.elapsed().as_secs_f64();
+    let _ = logger.log_task(
+        user_request,
+        &analysis.task_type,
+        &all_completed,
+        compile_ok,
+        &[],
+        DSR1,
+        elapsed,
+    );
+    let log_name = format!(
+        "{}_log.md",
+        work_dir.file_name().unwrap_or_default().to_string_lossy()
+    );
+    println!("{GRAY}📝 日志已更新 → {log_name}{RESET}");
+
+    let elapsed_str = if elapsed >= 60.0 {
+        format!("{}m {:.0}s", elapsed as u64 / 60, elapsed % 60.0)
+    } else {
+        format!("{:.1}s", elapsed)
+    };
+    println!("{PINK}✻ Baked for {elapsed_str}{RESET}");
 
     context.push(format!("User: {user_request}"));
-    context.push(format!("Assistant: Completed {} steps", plan.steps.len()));
-    
+    context.push(format!(
+        "Assistant: Completed {} steps ({}), compile_ok={}",
+        plan.steps.len(), analysis.task_type, compile_ok
+    ));
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let _ = state.lock().unwrap().save_session(&session_id, context);
-    
+
     Ok(())
 }

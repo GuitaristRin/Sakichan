@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     let state = Arc::new(Mutex::new(AppState::new(work_dir.clone())));
 
     // 5. Print welcome
-    print_welcome("0.1.0", &models);
+    print_welcome("0.2.0", &models);
 
     // 5b. Check git status
     let git_ok = std::process::Command::new("git")
