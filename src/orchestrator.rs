@@ -489,6 +489,21 @@ fn write_or_patch_files(
             }
         } else {
             let fpath = work_dir.join(filename);
+            // Guard: never overwrite an existing source file with non-code content.
+            // Detects markdown/plain-text masquerading as a .rs/.py/.cpp file.
+            let is_source_ext = ["rs", "py", "cpp", "c", "go", "js", "ts", "java"].iter()
+                .any(|e| filename.ends_with(&format!(".{e}")));
+            if is_source_ext && fpath.exists() {
+                let looks_like_prose = code.lines().take(10).any(|l| {
+                    let t = l.trim();
+                    t.starts_with("# ") || t.starts_with("## ") || t.starts_with("---")
+                    || t.starts_with("**") || t.starts_with("- ") && !t.contains("//")
+                });
+                if looks_like_prose {
+                    println!("{YELLOW}  ⚠ 文档步骤尝试覆盖源代码文件 {filename}，已跳过{RESET}");
+                    continue;
+                }
+            }
             let old_content = fs::read_to_string(&fpath).unwrap_or_default();
             if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
             let _ = fs::write(&fpath, code);
@@ -623,7 +638,7 @@ fn review_has_warnings(review: &str) -> bool {
 }
 
 fn arch_has_issues(arch: &str) -> bool {
-    arch.contains("[MINOR]") || arch.contains("[MAJOR]")
+    arch.contains("[MAJOR]")
 }
 
 // Fix 1c: review/architect prompts now receive the analysis_doc mental model.
@@ -925,9 +940,11 @@ Output ONLY valid JSON with this schema:\n\
 {{\"steps\":[{{\"id\":1,\"name\":\"动词开头的步骤名\",\"submodule_prompt\":\"完整独立prompt，包含：职责、输入接口、输出规范、不负责的范围。执行模型无需其他上下文即可完成工作。\",\"assigned_model\":\"QWEN\",\"files_to_create\":[\"path/to/file.rs\"],\"needs_compile\":false,\"verification\":\"如何验证\"}}]}}\n\n\
 Rules:\n\
 - submodule_prompt MUST be self-contained; orchestrator will prepend project background\n\
-- assigned_model is \"QWEN\" (for straightforward tasks) or \"DSR1\" (for complex logic/architecture)\n\
+- assigned_model: \"QWEN\" ONLY for straightforward source-code generation (.rs/.py/.js etc.); \"DSR1\" for everything else — including documentation, reports, analysis, markdown writing, architecture design, and any task where the primary output is text/markdown\n\
+- When output file extension is .md, .txt, or involves no compilation, assigned_model MUST be \"DSR1\"\n\
 - step names MUST start with a verb (e.g. \"实现 Fibonacci 函数\", not \"Fibonacci 函数\")\n\
-- If task has no code to write (analysis, essay, etc.), steps should create output files\n\
+- For non-code tasks (docs, reports, analysis): files_to_create MUST use .md or .txt extension and MUST be NEW files — NEVER list existing .rs/.py source files as output targets\n\
+- If the user says \"save to root directory\", root means the project root (where Cargo.toml lives), NOT src/\n\
 - needs_compile: true ONLY if this step produces source code intended for compilation (e.g. .rs, .cpp, .c)\n\
 - needs_compile: false for documentation, reports, analysis, markdown, config files, plain text, etc.\n\
 - When in doubt, set needs_compile to false\n\
