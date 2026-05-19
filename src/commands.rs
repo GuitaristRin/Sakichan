@@ -4,6 +4,7 @@ use anyhow::Result;
 use chrono::Local;
 use std::collections::HashMap;
 use std::fs;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 pub fn get_i18n() -> HashMap<String, HashMap<String, String>> {
@@ -100,6 +101,9 @@ pub fn handle_command(
                 ("/export <id>", "导出会话 / Export session"),
                 ("/edit", "切换编辑模式 / Toggle edit mode"),
                 ("/lang <zh|en>", "切换语言 / Switch language"),
+                ("/undo [n]", "回滚 git checkpoint / Rollback checkpoint(s)"),
+                ("/history", "显示 sakichan 提交历史 / Show sakichan commits"),
+                ("/diff", "显示当前 git diff / Show git diff --stat"),
                 ("/exit", "退出 / Exit"),
             ];
             for (c, desc) in &cmds {
@@ -246,6 +250,78 @@ pub fn handle_command(
                 println!("{GREEN}Language switched to English{RESET}");
             } else {
                 println!("{YELLOW}用法: /lang <zh|en>{RESET}");
+            }
+        }
+        "/undo" => {
+            let (work_dir, checkpoint_count) = {
+                let st = state.lock().unwrap();
+                (st.work_dir.clone(), st.checkpoint_count)
+            };
+            let n: u32 = if arg.is_empty() {
+                checkpoint_count
+            } else {
+                arg.parse().unwrap_or(1)
+            };
+            if n == 0 {
+                println!("{YELLOW}没有可回滚的 checkpoint / No checkpoints to undo{RESET}");
+            } else {
+                let out = Command::new("git")
+                    .args(["reset", "--hard", &format!("HEAD~{n}")])
+                    .current_dir(&work_dir)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => {
+                        state.lock().unwrap().checkpoint_count = 0;
+                        println!("{GREEN}✓ 已回滚 {n} 个 checkpoint / Rolled back {n} checkpoint(s){RESET}");
+                    }
+                    Ok(o) => {
+                        let err = String::from_utf8_lossy(&o.stderr);
+                        println!("{RED}回滚失败 / Rollback failed: {}{RESET}", err.trim());
+                    }
+                    Err(e) => println!("{RED}Git 错误 / Git error: {e}{RESET}"),
+                }
+            }
+        }
+        "/history" => {
+            let work_dir = state.lock().unwrap().work_dir.clone();
+            let out = Command::new("git")
+                .args(["log", "--oneline", "--grep=sakichan", "-n", "20"])
+                .current_dir(&work_dir)
+                .output();
+            match out {
+                Ok(o) => {
+                    let text = String::from_utf8_lossy(&o.stdout);
+                    if text.trim().is_empty() {
+                        println!("{GRAY}无 sakichan 相关 commit / No sakichan commits found{RESET}");
+                    } else {
+                        println!("{CYAN}● Git(log --grep=sakichan){RESET}");
+                        for line in text.lines() {
+                            println!("  {GRAY}{line}{RESET}");
+                        }
+                    }
+                }
+                Err(e) => println!("{RED}Git 错误 / Git error: {e}{RESET}"),
+            }
+        }
+        "/diff" => {
+            let work_dir = state.lock().unwrap().work_dir.clone();
+            let out = Command::new("git")
+                .args(["diff", "--stat"])
+                .current_dir(&work_dir)
+                .output();
+            match out {
+                Ok(o) => {
+                    let text = String::from_utf8_lossy(&o.stdout);
+                    if text.trim().is_empty() {
+                        println!("{GRAY}无未提交修改 / No uncommitted changes{RESET}");
+                    } else {
+                        println!("{CYAN}● Git(diff --stat){RESET}");
+                        for line in text.lines() {
+                            println!("  {GRAY}{line}{RESET}");
+                        }
+                    }
+                }
+                Err(e) => println!("{RED}Git 错误 / Git error: {e}{RESET}"),
             }
         }
         "/exit" | "/quit" => {

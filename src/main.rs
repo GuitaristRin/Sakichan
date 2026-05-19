@@ -52,6 +52,36 @@ fn main() -> Result<()> {
     // 5. Print welcome
     print_welcome("0.1.0", &models);
 
+    // 5b. Check git status
+    let git_ok = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&work_dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if git_ok {
+        let branch = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&work_dir)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let dirty = std::process::Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(&work_dir)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| if s.trim().is_empty() { "clean" } else { "dirty" }.to_string())
+            .unwrap_or_default();
+        println!("{GREEN}● Git(status){RESET} {GRAY}branch: {} · {dirty}{RESET}", branch.trim());
+    } else {
+        println!("{YELLOW}⚠ 当前目录不是 Git 仓库 — 运行 'git init' 以启用回滚功能 / Not a git repo — run 'git init' to enable rollback{RESET}");
+    }
+    println!();
+
     // 6. REPL loop
     let i18n = get_i18n();
     let mut context: Vec<String> = Vec::new();

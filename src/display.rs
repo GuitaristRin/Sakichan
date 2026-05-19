@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -50,24 +51,65 @@ pub fn print_cmd_result(cmd: &str, success: bool, output: &str, duration: f64) {
     }
 }
 
-pub fn print_code_diff(filename: &str, old_lines: &[&str], new_lines: &[&str]) {
-    println!("{CYAN}📄 {filename}{RESET}");
-    if old_lines.is_empty() {
-        println!("  {GREEN}(new file){RESET}");
-        return;
+/// Claude Code style "● Bash(cmd)" block with limited output lines.
+pub fn print_bash_result(cmd: &str, output: &str, max_lines: usize) {
+    println!("{CYAN}  ● Bash({cmd}){RESET}");
+    let non_empty: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = non_empty.len();
+    for line in non_empty.iter().take(max_lines) {
+        println!("    {GRAY}⎿  {line}{RESET}");
     }
-    let max_show = 20usize;
-    let mut shown = 0;
-    for line in old_lines {
+    if total > max_lines {
+        println!("    {GRAY}… +{} lines{RESET}", total - max_lines);
+    }
+}
+
+/// Show a set-based line diff for the given file. Returns (added, removed) counts.
+pub fn print_code_diff(filename: &str, old_content: &str, new_content: &str) -> (usize, usize) {
+    let old_lines: Vec<&str> = old_content.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+    let old_set: HashSet<&str> = old_lines.iter().copied().collect();
+    let new_set: HashSet<&str> = new_lines.iter().copied().collect();
+
+    let removed: Vec<&str> = old_lines.iter().filter(|&&l| !new_set.contains(l)).copied().collect();
+    let added: Vec<&str> = new_lines.iter().filter(|&&l| !old_set.contains(l)).copied().collect();
+    let added_count = added.len();
+    let removed_count = removed.len();
+
+    if old_content.is_empty() {
+        println!("{GREEN}  ● Create({filename}){RESET}");
+    } else {
+        println!("{CYAN}  ● Update({filename}){RESET}");
+    }
+
+    let max_show = 10usize;
+    let mut shown = 0usize;
+    for line in removed.iter() {
         if shown >= max_show { break; }
-        println!("  {RED}-{RESET} {DIM}{line}{RESET}");
+        println!("    {RED}-{RESET} {DIM}{}{RESET}", line);
         shown += 1;
     }
-    shown = 0;
-    for line in new_lines {
+    for line in added.iter() {
         if shown >= max_show { break; }
-        println!("  {GREEN}+{RESET} {line}");
+        println!("    {GREEN}+{RESET} {}", line);
         shown += 1;
+    }
+    println!("  {GRAY}⎿  Added {added_count} lines, removed {removed_count} lines{RESET}");
+    (added_count, removed_count)
+}
+
+/// Print a deduped list of all files modified during this session.
+pub fn print_change_summary(files: &[String]) {
+    let mut seen = HashSet::new();
+    let unique: Vec<&str> = files.iter()
+        .filter(|f| seen.insert(f.as_str()))
+        .map(|f| f.as_str())
+        .collect();
+    println!("{GRAY}---{RESET}");
+    println!("  {BOLD}改动总结 / Change Summary{RESET}");
+    println!("  共修改 {} 个文件 / {} files modified:", unique.len(), unique.len());
+    for f in &unique {
+        println!("    {GRAY}{f}{RESET}");
     }
 }
 

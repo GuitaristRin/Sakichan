@@ -44,6 +44,7 @@ pub struct AppState {
     pub work_dir: PathBuf,
     pub usage: PersistUsage,
     pub usage_file: PathBuf,
+    pub checkpoint_count: u32,
 }
 
 impl AppState {
@@ -58,6 +59,7 @@ impl AppState {
             work_dir,
             usage,
             usage_file,
+            checkpoint_count: 0,
         }
     }
 

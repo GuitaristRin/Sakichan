@@ -8,7 +8,8 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use chrono;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -234,6 +235,30 @@ fn get_output_language(state: &Arc<Mutex<AppState>>) -> String {
     else { "English".to_string() }
 }
 
+fn create_sandbox(work_dir: &Path) -> Result<PathBuf> {
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let sandbox = work_dir.join(".sakichan").join("sandboxes").join(&timestamp);
+    fs::create_dir_all(&sandbox)?;
+    Ok(sandbox)
+}
+
+fn git_checkpoint(executor: &Executor, description: &str) -> String {
+    let _ = executor.run("git add -A");
+    let safe_desc: String = description.chars()
+        .map(|c| if c == '"' || c == '\\' { '-' } else { c })
+        .collect();
+    let msg = format!("sakichan: checkpoint before '{safe_desc}'");
+    let cmd = format!("git commit -m \"{msg}\" --allow-empty 2>&1");
+    match executor.run(&cmd) {
+        Ok((true, _, _)) => format!("Created checkpoint: {msg}"),
+        Ok((false, output, _)) => {
+            let err = output.lines().next().unwrap_or("git error").trim().to_string();
+            format!("Git: {err}")
+        }
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
 fn gather_context(
     ollama: &OllamaClient,
     user_request: &str,
@@ -284,6 +309,8 @@ pub fn run_orchestrator(
     user_request: &str,
     context: &mut Vec<String>,
 ) -> Result<()> {
+    let run_start = Instant::now();
+
     let (host, model, work_dir, edit_mode, output_lang) = {
         let st = state.lock().unwrap();
         (st.ollama_host.clone(), st.current_model.clone(), st.work_dir.clone(), st.edit_mode,
@@ -461,6 +488,7 @@ Rules: {}
 Existing files: {}
 
 IMPORTANT: If no Cargo.toml exists, the first step MUST create it.
+Step names MUST start with a verb and describe the action concisely. Good: 'Implement Fibonacci function'. Bad: 'Fibonacci function'.
 
 Respond with ONLY JSON (all explanation text in {}):
 {{"steps":[{{"id":1,"name":"step","description":"detail","files_to_create":["path.rs"],"verification":"cargo check"}}]}}"#,
@@ -497,14 +525,38 @@ Respond with ONLY JSON (all explanation text in {}):
     // ══════════════════════════════════════════════════════════════════
     let mut all_completed_files: Vec<String> = Vec::new();
     let step_count = plan.steps.len();
+    let mut any_step_failed = false;
+
+    // 3a: Create sandbox before executing any steps
+    let sandbox_path: Option<PathBuf> = if edit_mode {
+        match create_sandbox(&work_dir) {
+            Ok(path) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                println!("{CYAN}  ● Sandbox(create){RESET}");
+                println!("  {GRAY}⎿  Created: .sakichan/sandboxes/{name}{RESET}");
+                Some(path)
+            }
+            Err(e) => {
+                println!("{YELLOW}⚠ 沙箱创建失败 / Sandbox creation failed: {e}{RESET}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     for (step_idx, step) in plan.steps.iter().enumerate() {
-        println!("{PINK}🔨 [{}/{}] {}{RESET}", step_idx + 1, step_count, step.name);
+        println!("{PINK}● {}/{}: {}{RESET}", step_idx + 1, step_count, step.name);
 
         if !edit_mode {
             println!("{YELLOW}⚠️  只读模式，跳过文件写入{RESET}");
             continue;
         }
+
+        let checkpoint_info = git_checkpoint(&executor, &step.name);
+        state.lock().unwrap().checkpoint_count += 1;
+        println!("{CYAN}  ● Git(checkpoint){RESET}");
+        println!("  {GRAY}⎿  {checkpoint_info}{RESET}");
 
         let _ = ensure_cargo_toml(&work_dir);
         let existing_code = gather_existing_code(&work_dir, &step.files_to_create);
@@ -565,16 +617,18 @@ Write FULL compilable code. All explanation in {lang}."#,
             for (_lang, filename, code) in &blocks {
                 if filename.is_empty() { continue; }
                 let fpath = work_dir.join(filename);
+                let old_content = fs::read_to_string(&fpath).unwrap_or_default();
                 if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
                 let _ = fs::write(&fpath, code);
-                println!("{GREEN}💾 已保存: {filename}{RESET}");
+                print_code_diff(filename, &old_content, code);
                 all_completed_files.push(filename.clone());
             }
-    
+
             let (ok, output, _dur) = executor.run("cargo check 2>&1")?;
 
             if ok {
-                println!("{GREEN}✅ 编译通过 (qwen, attempt {attempt}){RESET}");
+                print_bash_result("cargo check 2>&1", &output, 5);
+                println!("{GREEN}  ✓ 编译通过 (qwen, attempt {attempt}){RESET}");
                 compile_ok = true;
                 break;
             } else {
@@ -588,36 +642,38 @@ Write FULL compilable code. All explanation in {lang}."#,
             step_model = DSR1.to_string();
             println!("{RED}🔄 qwen 失败，切换到 deepseek-r1 (最多 10 次)...{RESET}");
             prompt_c = format!("## Environment\n- OS: Windows 11\n- Shell: PowerShell\n- Commands use PowerShell syntax (e.g., dir not ls, ; not &&)\n- Path separator: \\\n\nURGENT: Fix ALL compile errors. All text in {}.\n\n{}", output_lang, base_prompt);
-    
+
             for attempt in 1..=DSR1_MAX_RETRIES {
                 let spinner = Spinner::new(SpinnerState::FixingDsr1);
                 let (code_raw, usage_c) = ollama.chat(&step_model, &prompt_c)?;
                 spinner.update_tokens(usage_c.input_tokens + usage_c.output_tokens);
                 spinner.stop();
                 record_usage(state, &usage_c);
-    
+
                 let (code_clean, tool_results) = process_tool_calls(&code_raw, &work_dir);
                 if !tool_results.is_empty() { prompt_c.push_str(&format!("\n\n{tool_results}")); }
-    
+
                 let blocks = extract_code_blocks(&code_clean);
                 if blocks.is_empty() {
                     if attempt < DSR1_MAX_RETRIES { continue; }
                     break;
                 }
-    
+
                 for (_lang, filename, code) in &blocks {
                     if filename.is_empty() { continue; }
                     let fpath = work_dir.join(filename);
+                    let old_content = fs::read_to_string(&fpath).unwrap_or_default();
                     if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
                     let _ = fs::write(&fpath, code);
-                    println!("{GREEN}💾 已保存: {filename}{RESET}");
+                    print_code_diff(filename, &old_content, code);
                     all_completed_files.push(filename.clone());
                 }
-    
+
                 let (ok, output, _dur) = executor.run("cargo check 2>&1")?;
 
                 if ok {
-                    println!("{GREEN}✅ 编译通过 (dsr1, attempt {attempt}){RESET}");
+                    print_bash_result("cargo check 2>&1", &output, 5);
+                    println!("{GREEN}  ✓ 编译通过 (dsr1, attempt {attempt}){RESET}");
                     compile_ok = true;
                     break;
                 } else {
@@ -631,7 +687,16 @@ Write FULL compilable code. All explanation in {lang}."#,
         let _ = logger.log_task(&step.name, &step.description, &all_completed_files, compile_ok, &[], &step_model, step_duration);
     
         if !compile_ok {
+            any_step_failed = true;
             println!("{RED}❌ 编译失败 after {} attempts{RESET}", QWEN_MAX_RETRIES + DSR1_MAX_RETRIES);
+            // 3b: Rollback this step's changes via git
+            if let Ok((reverted, _, _)) = executor.run("git checkout -- .") {
+                if reverted {
+                    println!("{RED}  ● Sandbox(rollback){RESET}");
+                    println!("  {GRAY}⎿  Rolling back step {} after {} failed attempts{RESET}",
+                        step.id, QWEN_MAX_RETRIES + DSR1_MAX_RETRIES);
+                }
+            }
         }
     }
     
@@ -653,8 +718,30 @@ Write FULL compilable code. All explanation in {lang}."#,
         let _ = rules_mgr.update(&all_completed_files, &structure);
         println!("{GRAY}📄 规则文件已更新 / Rules updated{RESET}");
         println!("{GRAY}📝 日志已更新 / Log updated{RESET}");
+
+        if ok {
+            print_change_summary(&all_completed_files);
+        }
+
+        let elapsed = run_start.elapsed().as_secs_f64();
+        let elapsed_str = if elapsed >= 60.0 {
+            format!("{}m {:.0}s", elapsed as u64 / 60, elapsed % 60.0)
+        } else {
+            format!("{:.1}s", elapsed)
+        };
+        println!("{PINK}✻ Baked for {elapsed_str}{RESET}");
     }
-    
+
+    // 3c: Sandbox cleanup after Phase 5
+    if let Some(ref sandbox) = sandbox_path {
+        if any_step_failed {
+            println!("{YELLOW}⚠ 沙箱保留（有步骤失败），使用 /undo 可回滚 / Sandbox kept — use /undo to rollback{RESET}");
+        } else {
+            let _ = fs::remove_dir_all(sandbox);
+            println!("{GRAY}🧹 沙箱已清理 / Sandbox cleaned up{RESET}");
+        }
+    }
+
     context.push(format!("User: {user_request}"));
     context.push(format!("Assistant: Completed {} steps", plan.steps.len()));
     
