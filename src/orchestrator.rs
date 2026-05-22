@@ -1,8 +1,14 @@
+use crate::backend::{create_backend, LlmBackend, ModelOptions, UsageStats};
+use crate::config::SakichanConfig;
 use crate::display::*;
 use crate::executor::Executor;
+use crate::handoff::{
+    self, build_fix_prompt, build_generation_prompt, Constraint, Issue, IssueSeverity,
+    MajorRestartReport, Module, ReviewResult, ReviewStatus,
+};
 use crate::logger::Logger;
-use crate::ollama::{ModelOptions, OllamaClient, UsageStats};
 use crate::rules::RulesManager;
+use crate::slots::SlotRole;
 use crate::state::AppState;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -15,67 +21,80 @@ use std::time::Instant;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const QWEN: &str = "qwen2.5-coder:7b";
-const DSR1: &str = "deepseek-r1:8b";
 const REVIEW_MAX_ATTEMPTS: usize = 3;
 const CARGO_FIX_MAX: usize = 5;
 const MAX_RESTART: usize = 3;
 
-const ROLE_QWEN: &str = "你是 Saki-chan 的 Programmer 模块（由 Qwen2.5-Coder 驱动）。\n\
-    职责：按规范实现代码，严格遵循接口定义、文件路径和语言约定。不做架构决策。\n\n";
-const ROLE_DSR1: &str = "你是 Saki-chan 的 Engineer & Architect 模块（由 DeepSeek-R1 驱动）。\n\
-    职责：需求分析、方案规划、架构设计、跨模块一致性检查与调试修复。\n\n";
+// ── Model call helpers ────────────────────────────────────────────────────────
 
-// ── Model presets ─────────────────────────────────────────────────────────────
-
-fn dsr1_opts() -> ModelOptions {
-    ModelOptions {
-        temperature: Some(0.3),
-        top_p: Some(0.85),
-        top_k: Some(40),
-        num_predict: Some(-1),
-        num_ctx: Some(8192),
-        ..Default::default()
+fn record_usage(state: &Arc<Mutex<AppState>>, usage: &UsageStats) {
+    if let Ok(mut st) = state.lock() {
+        st.usage.add(usage);
+        let _ = st.save_usage();
     }
 }
 
-fn qwen_ctx_opts() -> ModelOptions {
-    ModelOptions {
-        temperature: Some(0.1),
-        top_p: Some(0.8),
-        top_k: Some(20),
-        num_predict: Some(2048),
-        repeat_penalty: Some(1.05),
-        seed: Some(42),
-        num_ctx: Some(8192),
+fn add_tokens(global_tokens: &Arc<Mutex<u64>>, usage: &UsageStats) {
+    if let Ok(mut t) = global_tokens.lock() {
+        *t += usage.input_tokens + usage.output_tokens;
     }
 }
 
-fn qwen_gen_opts() -> ModelOptions {
-    ModelOptions {
-        temperature: Some(0.2),
-        top_p: Some(0.8),
-        top_k: Some(20),
-        num_predict: Some(2048),
-        repeat_penalty: Some(1.05),
-        seed: Some(42),
-        num_ctx: Some(8192),
+fn call_model(
+    backend: &dyn LlmBackend,
+    model: &str,
+    prompt: &str,
+    opts: &ModelOptions,
+    work_dir: &Path,
+    state: &Arc<Mutex<AppState>>,
+    global_tokens: &Arc<Mutex<u64>>,
+    global_start: &Arc<Instant>,
+    spin: SpinnerState,
+) -> Result<String> {
+    let spinner = Spinner::new(spin, Arc::clone(global_tokens), Arc::clone(global_start));
+    let (raw, usage) = backend.generate_complete(model, prompt, opts)?;
+    add_tokens(global_tokens, &usage);
+    spinner.stop();
+    record_usage(state, &usage);
+
+    let (clean, tool_results) = process_system_calls(&raw, work_dir);
+    if tool_results.is_empty() {
+        return Ok(raw);
     }
+
+    println!("{GRAY}  🔍 解析工具调用结果，追加上下文重新生成...{RESET}");
+    let followup = format!(
+        "{prompt}\n\n## Tool call results:\n{tool_results}\n\nNow generate the complete output:"
+    );
+    let sp2 = Spinner::new(SpinnerState::Crafting, Arc::clone(global_tokens), Arc::clone(global_start));
+    let (raw2, usage2) = match backend.generate_complete(model, &followup, opts) {
+        Ok(r) => r,
+        Err(_) => { sp2.stop(); return Ok(clean); }
+    };
+    add_tokens(global_tokens, &usage2);
+    sp2.stop();
+    record_usage(state, &usage2);
+    Ok(raw2)
 }
 
-// ── Module spec ───────────────────────────────────────────────────────────────
+// ── Slot model/options resolution ─────────────────────────────────────────────
 
-struct Module {
-    name: String,
-    full_spec: String,
-    needs_compile: bool,
-    assigned_model: String,
+fn slot_model(role: SlotRole, state: &Arc<Mutex<AppState>>) -> String {
+    state.lock().unwrap()
+        .slot_assignments
+        .get(role.name())
+        .cloned()
+        .unwrap_or_else(|| match role {
+            SlotRole::Architect | SlotRole::SeniorEngineer => "deepseek-r1:8b".to_string(),
+            _ => "qwen2.5-coder:7b".to_string(),
+        })
 }
 
-fn resolve_model(assigned: &str) -> &'static str {
-    let up = assigned.to_uppercase();
-    if up.contains("DSR") || up.contains("DEEP") { DSR1 } else { QWEN }
+fn slot_opts(role: SlotRole, config: &SakichanConfig) -> ModelOptions {
+    ModelOptions::from_preset(&config.get_preset_for_slot(role.name()))
 }
+
+// ── Module parsing ────────────────────────────────────────────────────────────
 
 fn parse_modules(plan_text: &str) -> Vec<Module> {
     let text = plan_text
@@ -96,14 +115,8 @@ fn parse_modules(plan_text: &str) -> Vec<Module> {
                 }
             }
             current_block.clear();
-            let name = t
-                .trim_start_matches("[MODULE:")
-                .trim_end_matches(']')
-                .trim()
-                .to_string();
-            if !name.is_empty() {
-                current_name = Some(name);
-            }
+            let name = t.trim_start_matches("[MODULE:").trim_end_matches(']').trim().to_string();
+            if !name.is_empty() { current_name = Some(name); }
         } else if current_name.is_some() {
             current_block.push_str(line);
             current_block.push('\n');
@@ -118,16 +131,13 @@ fn parse_modules(plan_text: &str) -> Vec<Module> {
     if modules.is_empty() {
         let any_compile = plan_text.to_lowercase().contains("needs_compile: true")
             || plan_text.to_lowercase().contains("needs_compile:true");
-        let assigned = if plan_text.to_uppercase().contains("DSR1") {
-            "DSR1".to_string()
-        } else {
-            "QWEN".to_string()
-        };
+        let slot = detect_slot_from_text(plan_text);
         modules.push(Module {
             name: "主模块".to_string(),
             full_spec: plan_text.chars().take(2000).collect(),
             needs_compile: any_compile,
-            assigned_model: assigned,
+            assigned_slot: slot,
+            ..Default::default()
         });
     }
     modules
@@ -135,22 +145,69 @@ fn parse_modules(plan_text: &str) -> Vec<Module> {
 
 fn build_module(name: String, block: &str) -> Module {
     let mut needs_compile = false;
-    let mut assigned_model = "QWEN".to_string();
+    let mut assigned_slot = SlotRole::Programmer;
+    let inputs = Vec::new();
+    let outputs = Vec::new();
+    let mut constraints = Vec::new();
+    let mut verification = Vec::new();
+    let mut in_constraints = false;
+    let mut in_verification = false;
+
     for line in block.lines() {
         let t = line.trim();
+
         if let Some(v) = t.strip_prefix("needs_compile:") {
             needs_compile = v.trim() == "true";
+            in_constraints = false; in_verification = false;
+        } else if let Some(v) = t.strip_prefix("assigned_slot:") {
+            assigned_slot = SlotRole::from_str(v.trim()).unwrap_or(SlotRole::Programmer);
+            in_constraints = false; in_verification = false;
         } else if let Some(v) = t.strip_prefix("assigned_model:") {
-            let up = v.trim().to_uppercase();
-            assigned_model = if up.contains("DSR") || up.contains("DEEP") {
-                "DSR1".to_string()
-            } else {
-                "QWEN".to_string()
-            };
+            // backward compat
+            assigned_slot = SlotRole::from_str(v.trim()).unwrap_or(SlotRole::Programmer);
+            in_constraints = false; in_verification = false;
+        } else if t.starts_with("inputs:") || t.starts_with("input:") {
+            in_constraints = false; in_verification = false;
+        } else if t.starts_with("outputs:") || t.starts_with("output:") {
+            in_constraints = false; in_verification = false;
+        } else if t.starts_with("constraints:") {
+            in_constraints = true; in_verification = false;
+        } else if t.starts_with("verification:") || t.starts_with("verify:") {
+            in_constraints = false; in_verification = true;
+        } else if in_constraints && (t.starts_with("- ") || t.starts_with("* ")) {
+            let content = t.trim_start_matches("- ").trim_start_matches("* ");
+            if let Some(c) = Constraint::parse_line(content) {
+                constraints.push(c);
+            }
+        } else if in_verification && (t.starts_with("- ") || t.starts_with("* ")) {
+            let content = t.trim_start_matches("- ").trim_start_matches("* ");
+            if !content.is_empty() { verification.push(content.to_string()); }
         }
     }
-    Module { name, full_spec: block.to_string(), needs_compile, assigned_model }
+
+    Module {
+        name,
+        inputs,
+        outputs,
+        implementation: String::new(),
+        constraints,
+        verification,
+        assigned_slot,
+        needs_compile,
+        full_spec: block.to_string(),
+    }
 }
+
+fn detect_slot_from_text(text: &str) -> SlotRole {
+    let up = text.to_uppercase();
+    if up.contains("DSR1") || up.contains("DEEPSEEK") || up.contains("ARCHITECT") {
+        SlotRole::Architect
+    } else {
+        SlotRole::Programmer
+    }
+}
+
+// ── Question parsing ──────────────────────────────────────────────────────────
 
 fn parse_questions(response: &str) -> Vec<String> {
     let mut questions = Vec::new();
@@ -170,9 +227,7 @@ fn parse_questions(response: &str) -> Vec<String> {
             } else {
                 t.to_string()
             };
-            if !q.is_empty() && !questions.contains(&q) {
-                questions.push(q);
-            }
+            if !q.is_empty() && !questions.contains(&q) { questions.push(q); }
         }
     }
     questions.truncate(3);
@@ -201,12 +256,18 @@ fn list_files_in(dir: &Path) -> Vec<String> {
     files
 }
 
+fn generate_project_tree(work_dir: &Path) -> String {
+    let name = work_dir.file_name().unwrap_or_default().to_string_lossy();
+    let mut lines = vec![format!("{}/", name)];
+    build_tree(work_dir, "", &mut lines);
+    lines.join("\n")
+}
+
 fn build_tree(dir: &Path, prefix: &str, lines: &mut Vec<String>) {
     const SKIP: &[&str] = &["target", ".git"];
     let Ok(read) = fs::read_dir(dir) else { return };
     let parent = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let mut items: Vec<_> = read
-        .filter_map(|e| e.ok())
+    let mut items: Vec<_> = read.filter_map(|e| e.ok())
         .filter(|e| {
             let n = e.file_name().to_string_lossy().to_string();
             if SKIP.contains(&n.as_str()) { return false; }
@@ -219,21 +280,25 @@ fn build_tree(dir: &Path, prefix: &str, lines: &mut Vec<String>) {
         let is_last = i == items.len() - 1;
         let conn = if is_last { "└── " } else { "├── " };
         let name = entry.file_name().to_string_lossy().to_string();
-        let path = entry.path();
-        let is_dir = path.is_dir();
+        let is_dir = entry.path().is_dir();
         lines.push(format!("{}{}{}{}", prefix, conn, name, if is_dir { "/" } else { "" }));
         if is_dir {
             let child = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
-            build_tree(&path, &child, lines);
+            build_tree(&entry.path(), &child, lines);
         }
     }
 }
 
-fn generate_project_tree(work_dir: &Path) -> String {
-    let name = work_dir.file_name().unwrap_or_default().to_string_lossy();
-    let mut lines = vec![format!("{}/", name)];
-    build_tree(work_dir, "", &mut lines);
-    lines.join("\n")
+fn build_code_context(written_files: &HashMap<String, String>) -> String {
+    if written_files.is_empty() { return "(no files generated yet)".to_string(); }
+    let mut sorted: Vec<_> = written_files.iter().collect();
+    sorted.sort_by_key(|(k, _)| k.as_str());
+    sorted.iter().map(|(f, c)| format!("=== {} ===\n{}\n\n", f, c)).collect()
+}
+
+fn solution_section(design: &str) -> String {
+    if design.is_empty() { String::new() }
+    else { format!("## 解决方案设计（Phase C，请仔细阅读）\n{design}\n\n") }
 }
 
 // ── Grep helpers ──────────────────────────────────────────────────────────────
@@ -258,7 +323,7 @@ fn grep_file(root: &Path, path: &Path, pattern: &str, ctx: usize, results: &mut 
         for j in idx.saturating_sub(ctx)..(idx + ctx + 1).min(lines.len()) { shown.insert(j); }
     }
     let mut prev: Option<usize> = None;
-    for &j in &shown.into_iter().collect::<Vec<_>>() {
+    for j in shown {
         if let Some(p) = prev { if j > p + 1 { results.push("  ---".to_string()); } }
         let marker = if matches.contains(&j) { "▶" } else { " " };
         results.push(format!("{}:{} {} {}", rel.display(), j + 1, marker, lines[j]));
@@ -305,7 +370,7 @@ fn grep_in_dir(work_dir: &Path, pattern: &str, search_path: &str, ctx: usize) ->
 fn web_search(query: &str) -> String {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent("Saki-chan/0.3.0")
+        .user_agent("Saki-chan/0.4.0")
         .build()
     {
         Ok(c) => c,
@@ -337,8 +402,7 @@ fn web_search(query: &str) -> String {
     if result.is_empty() {
         format!("[WEB SEARCH: no results for \"{query}\"]")
     } else {
-        let truncated: String = result.chars().take(1000).collect();
-        format!("[WEB SEARCH: \"{query}\"]\n{truncated}\n[/WEB SEARCH]")
+        format!("[WEB SEARCH: \"{query}\"]\n{}\n[/WEB SEARCH]", result.chars().take(1000).collect::<String>())
     }
 }
 
@@ -413,35 +477,7 @@ fn process_system_calls(response: &str, work_dir: &Path) -> (String, String) {
     (clean, tool_results)
 }
 
-// ── Token / usage helpers ─────────────────────────────────────────────────────
-
-fn record_usage(state: &Arc<Mutex<AppState>>, usage: &UsageStats) {
-    if let Ok(mut st) = state.lock() {
-        st.usage.add(usage);
-        let _ = st.save_usage();
-    }
-}
-
-fn add_global_tokens(global_tokens: &Arc<Mutex<u64>>, usage: &UsageStats) {
-    if let Ok(mut t) = global_tokens.lock() {
-        *t += usage.input_tokens + usage.output_tokens;
-    }
-}
-
 // ── File write helpers ────────────────────────────────────────────────────────
-
-fn gather_existing_code(work_dir: &Path, files: &[String]) -> String {
-    let mut result = String::new();
-    for f in files {
-        let fpath = work_dir.join(f);
-        if fpath.exists() {
-            if let Ok(content) = fs::read_to_string(&fpath) {
-                result.push_str(&format!("=== {} ===\n{}\n\n", f, content));
-            }
-        }
-    }
-    if result.is_empty() { "(no existing files)".to_string() } else { result }
-}
 
 fn ensure_cargo_toml(work_dir: &Path) {
     let cargo = work_dir.join("Cargo.toml");
@@ -468,7 +504,6 @@ fn write_or_patch_files(
             println!("{YELLOW}  ⚠ 非编译任务跳过源代码文件 {filename}{RESET}");
             continue;
         }
-
         if lang == "patch" {
             let old_snap = written_files.get(filename).cloned()
                 .or_else(|| fs::read_to_string(work_dir.join(filename)).ok())
@@ -495,7 +530,6 @@ fn write_or_patch_files(
             let fpath = work_dir.join(filename);
             let is_src = SRC_EXTS.iter().any(|e| filename.ends_with(&format!(".{e}")));
             if is_src && fpath.exists() {
-                // Guard: reject prose masquerading as source
                 let looks_prose = code.lines().take(10).any(|l| {
                     let t = l.trim();
                     t.starts_with("# ") || t.starts_with("## ") || t.starts_with("---")
@@ -505,14 +539,11 @@ fn write_or_patch_files(
                     println!("{YELLOW}  ⚠ 文档内容试图覆盖 {filename}，已跳过{RESET}");
                     continue;
                 }
-                // Guard: reject if new content < 30% of old line count
                 let old_content = fs::read_to_string(&fpath).unwrap_or_default();
                 let old_lines = old_content.lines().count();
                 let new_lines = code.lines().count();
                 if old_lines > 10 && new_lines < old_lines * 30 / 100 {
-                    println!(
-                        "{YELLOW}  ⚠ 拒绝写入 {filename}：新内容({new_lines}行)不足原来({old_lines}行)的30%{RESET}"
-                    );
+                    println!("{YELLOW}  ⚠ 拒绝写入 {filename}：新内容({new_lines}行)不足原来({old_lines}行)的30%{RESET}");
                     continue;
                 }
             }
@@ -525,15 +556,6 @@ fn write_or_patch_files(
         }
     }
 }
-
-fn build_code_context(written_files: &HashMap<String, String>) -> String {
-    if written_files.is_empty() { return "(no files generated yet)".to_string(); }
-    let mut sorted: Vec<_> = written_files.iter().collect();
-    sorted.sort_by_key(|(k, _)| k.as_str());
-    sorted.iter().map(|(f, c)| format!("=== {} ===\n{}\n\n", f, c)).collect()
-}
-
-// ── Patch application ─────────────────────────────────────────────────────────
 
 fn apply_patch(filename: &str, patch_content: &str, work_dir: &Path) -> Result<bool, String> {
     const OLD_M: &str = "---OLD---";
@@ -587,42 +609,70 @@ fn extract_code_blocks(response: &str) -> Vec<(String, String, String)> {
                 if let Some(pos) = line.find(".rs") {
                     let start = line[..pos].rfind(' ').map_or(0, |i| i + 1);
                     line[start..pos + 3].to_string()
-                } else {
-                    "src/lib.rs".to_string()
-                }
-            } else {
-                "src/lib.rs".to_string()
-            };
+                } else { "src/lib.rs".to_string() }
+            } else { "src/lib.rs".to_string() };
             results.push((lang, filename, code));
         }
     }
     results
 }
 
-fn parse_json_from_response(response: &str) -> Option<String> {
-    let start = response.find('{')?;
-    let sub = &response[start..];
-    let mut depth = 0i32;
-    let mut end = 0;
-    for (i, c) in sub.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 { end = i + 1; break; }
-            }
-            _ => {}
+// ── Extract helpers ───────────────────────────────────────────────────────────
+
+fn extract_solution_design(response: &str) -> String {
+    response.find("[SOLUTION_DESIGN]")
+        .map(|pos| response[pos + "[SOLUTION_DESIGN]".len()..].trim().to_string())
+        .unwrap_or_else(|| response.trim().to_string())
+}
+
+fn extract_think_block(response: &str) -> Option<String> {
+    response.find("[THINK]").map(|start| {
+        let after = &response[start + "[THINK]".len()..];
+        let end = after.find("```").unwrap_or(after.len());
+        after[..end].trim().to_string()
+    }).filter(|s| !s.is_empty())
+}
+
+fn extract_rules_update(response: &str) -> Option<String> {
+    response.find("[RULES_UPDATE]")
+        .map(|pos| response[pos + "[RULES_UPDATE]".len()..].trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_review_result(module_name: &str, raw: &str) -> ReviewResult {
+    let mut issues = Vec::new();
+    for line in raw.lines() {
+        let t = line.trim();
+        let (severity, rest) = if t.contains("[MAJOR]") {
+            (IssueSeverity::Major, t.replacen("[MAJOR]", "", 1))
+        } else if t.contains("[MINOR]") {
+            (IssueSeverity::Minor, t.replacen("[MINOR]", "", 1))
+        } else if t.contains("[INFO]") {
+            (IssueSeverity::Info, t.replacen("[INFO]", "", 1))
+        } else if t.contains('⚠') {
+            (IssueSeverity::Minor, t.replace('⚠', ""))
+        } else {
+            continue;
+        };
+        if !rest.trim().is_empty() {
+            issues.push(Issue { severity, location: None, description: rest.trim().to_string() });
         }
     }
-    if end > 0 { Some(sub[..end].to_string()) } else { None }
+    let status = if issues.iter().any(|i| matches!(i.severity, IssueSeverity::Major))
+        || raw.contains('⚠')
+    {
+        ReviewStatus::RevisionRequired
+    } else {
+        ReviewStatus::Approved
+    };
+    ReviewResult { module_name: module_name.to_string(), issues, status }
 }
 
 // ── Git helpers ───────────────────────────────────────────────────────────────
 
 fn git_checkpoint(work_dir: &Path, description: &str) -> String {
     let _ = Command::new("git").args(["add", "-A"]).current_dir(work_dir).output();
-    let safe: String = description
-        .chars()
+    let safe: String = description.chars()
         .map(|c| if c == '"' || c == '\'' || c == '\\' { '-' } else { c })
         .collect();
     let msg = format!("sakichan: checkpoint - {}", safe.chars().take(60).collect::<String>());
@@ -640,72 +690,64 @@ fn git_checkpoint(work_dir: &Path, description: &str) -> String {
     }
 }
 
-// ── Misc helpers ──────────────────────────────────────────────────────────────
+// ── Phase I: verification strategy ───────────────────────────────────────────
 
-fn solution_section(design: &str) -> String {
-    if design.is_empty() {
-        String::new()
-    } else {
-        format!("## 解决方案设计（Phase C，请仔细阅读）\n{}\n\n", design)
-    }
-}
-
-fn extract_think_block(response: &str) -> Option<String> {
-    response.find("[THINK]").map(|start| {
-        let after = &response[start + "[THINK]".len()..];
-        let end = after.find("```").unwrap_or(after.len());
-        after[..end].trim().to_string()
-    }).filter(|s| !s.is_empty())
-}
-
-fn extract_rules_update(response: &str) -> Option<String> {
-    response
-        .find("[RULES_UPDATE]")
-        .map(|pos| response[pos + "[RULES_UPDATE]".len()..].trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn extract_solution_design(response: &str) -> String {
-    response
-        .find("[SOLUTION_DESIGN]")
-        .map(|pos| response[pos + "[SOLUTION_DESIGN]".len()..].trim().to_string())
-        .unwrap_or_else(|| response.trim().to_string())
-}
-
-// One model call with optional system-call round-trip
-fn call_model(
-    ollama: &OllamaClient,
-    model: &str,
-    prompt: &str,
-    opts: &ModelOptions,
+fn run_verification(
+    config: &SakichanConfig,
     work_dir: &Path,
-    state: &Arc<Mutex<AppState>>,
-    global_tokens: &Arc<Mutex<u64>>,
-    global_start: &Arc<Instant>,
-    spin: SpinnerState,
-) -> Result<String> {
-    let spinner = Spinner::new(spin, Arc::clone(global_tokens), Arc::clone(global_start));
-    let (raw, usage) = ollama.chat(model, prompt, Some(opts))?;
-    add_global_tokens(global_tokens, &usage);
-    spinner.stop();
-    record_usage(state, &usage);
-
-    let (clean, tool_results) = process_system_calls(&raw, work_dir);
-    if tool_results.is_empty() {
-        return Ok(raw);
+    executor: &Executor,
+    written_files: &HashMap<String, String>,
+    any_compile: bool,
+) -> (bool, String) {
+    if !any_compile || written_files.is_empty() {
+        return (true, String::new());
     }
 
-    println!("{GRAY}  🔍 解析工具调用结果，追加上下文重新生成...{RESET}");
-    let followup = format!("{prompt}\n\n## Tool call results:\n{tool_results}\n\nNow generate the complete output:");
-    let sp2 = Spinner::new(SpinnerState::Crafting, Arc::clone(global_tokens), Arc::clone(global_start));
-    let (raw2, usage2) = match ollama.chat(model, &followup, Some(opts)) {
-        Ok(r) => r,
-        Err(_) => { sp2.stop(); return Ok(clean); }
+    let strategy = config.verification.iter()
+        .find(|v| v.detector.matches(work_dir));
+
+    let Some(strategy) = strategy else {
+        println!("{GRAY}  ℹ️  无匹配的验证策略，跳过自动化验证{RESET}");
+        return (true, String::new());
     };
-    add_global_tokens(global_tokens, &usage2);
-    sp2.stop();
-    record_usage(state, &usage2);
-    Ok(raw2)
+
+    println!("{CYAN}  🔍 验证策略: {}{RESET}", strategy.name);
+
+    let Some(cmd) = &strategy.command else {
+        println!("{GRAY}  ℹ️  此策略仅架构审查，无自动化命令{RESET}");
+        return (true, String::new());
+    };
+
+    let full_cmd = if strategy.args.is_empty() {
+        cmd.clone()
+    } else {
+        format!("{} {} 2>&1", cmd, strategy.args.join(" "))
+    };
+
+    let mut compile_ok = false;
+    let mut last_errors = String::new();
+
+    for attempt in 1..=CARGO_FIX_MAX {
+        let (ok, output, _) = match executor.run(&full_cmd) {
+            Ok(r) => r,
+            Err(e) => { println!("{RED}  ✗ 验证命令失败: {e}{RESET}"); break; }
+        };
+        if ok {
+            println!("{GREEN}  ✓ 编译通过 (attempt {attempt}){RESET}");
+            compile_ok = true;
+            last_errors.clear();
+            break;
+        }
+        last_errors = output.chars().take(1500).collect();
+        println!("{RED}  ✗ 编译失败 (attempt {attempt}){RESET}");
+        for line in output.lines().take(8) {
+            if line.contains("error") { println!("    {GRAY}{line}{RESET}"); }
+        }
+        if attempt == CARGO_FIX_MAX {
+            println!("{RED}  ❌ 编译失败 after {CARGO_FIX_MAX} attempts{RESET}");
+        }
+    }
+    (compile_ok, last_errors)
 }
 
 // ── Main orchestrator ─────────────────────────────────────────────────────────
@@ -718,17 +760,13 @@ pub fn run_orchestrator(
     let global_tokens = Arc::new(Mutex::new(0u64));
     let global_start = Arc::new(Instant::now());
 
-    let (host, work_dir, edit_mode, output_lang) = {
+    let (config, work_dir, output_lang) = {
         let st = state.lock().unwrap();
-        (
-            st.ollama_host.clone(),
-            st.work_dir.clone(),
-            st.edit_mode,
-            if st.lang == "zh_TW" { "Traditional Chinese (繁體中文)".to_string() } else { "English".to_string() },
-        )
+        let lang_str = if st.lang == "zh_TW" { "Traditional Chinese (繁體中文)" } else { "English" };
+        (st.config.clone(), st.work_dir.clone(), lang_str.to_string())
     };
 
-    let ollama = OllamaClient::new(&host);
+    let backend = create_backend(&config)?;
     let executor = Executor::new(work_dir.clone());
     let rules_mgr = RulesManager::new(work_dir.join(".sakichan.md"));
     let logger = Logger::from_work_dir(&work_dir);
@@ -736,12 +774,14 @@ pub fn run_orchestrator(
 
     let rules = rules_mgr.load();
     let project_tree = generate_project_tree(&work_dir);
-    let _files_str = list_files_in(&work_dir).join(", ");
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Phase A: 接收 — qwen 整理用户 prompt
-    // ═══════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════
+    // Phase A: Summarize — ProductOwner
+    // ══════════════════════════════════════════════════════════════════════
     println!("{CYAN}【A】整理需求...{RESET}");
+
+    let model_po = slot_model(SlotRole::ProductOwner, state);
+    let opts_po = slot_opts(SlotRole::ProductOwner, &config);
 
     let prompt_a = format!(
         "{role}请整理以下用户需求，输出自然语言摘要，包含：\n\
@@ -752,39 +792,39 @@ pub fn run_orchestrator(
         用户需求：{request}\n\n\
         项目目录：\n{tree}\n\n\
         项目规则：\n{rules}",
-        role = ROLE_QWEN,
+        role = SlotRole::ProductOwner.role_prompt(),
         request = user_request,
         tree = project_tree,
         rules = rules,
     );
 
     let summary_a = call_model(
-        &ollama, QWEN, &prompt_a, &qwen_ctx_opts(),
+        backend.as_ref(), &model_po, &prompt_a, &opts_po,
         &work_dir, state, &global_tokens, &global_start,
         SpinnerState::Thinking,
     )?;
-
     println!("{GRAY}  📋 需求摘要已生成 ({} chars){RESET}", summary_a.len());
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Phase B: 初步澄清 — dsr1 向用户确认需求
-    // ═══════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════
+    // Phase B: Clarification — ProductOwner
+    // ══════════════════════════════════════════════════════════════════════
     println!("{CYAN}【B】初步澄清...{RESET}");
 
     let prompt_b = format!(
         "{role}## 用户需求摘要\n{summary}\n\n\
         ## 项目规则\n{rules}\n\n\
-        请列出最多 3 个真正影响实现方向的问题（用数字序号），或者如果需求已经明确，输出 \"✅ 需求明确，无需澄清\"。\n\
-        不问能从项目文件推断的问题。不问废话。每个问题后附推荐答案（用方括号）。\n\
+        请列出最多 3 个真正影响实现方向的问题（用数字序号），\
+        或者如果需求已经明确，输出 \"✅ 需求明确，无需澄清\"。\n\
+        不问能从项目文件推断的问题。每个问题后附推荐答案（用方括号）。\n\
         所有输出用 {lang}。",
-        role = ROLE_DSR1,
+        role = SlotRole::ProductOwner.role_prompt(),
         summary = summary_a,
         rules = rules,
         lang = output_lang,
     );
 
     let b_raw = call_model(
-        &ollama, DSR1, &prompt_b, &dsr1_opts(),
+        backend.as_ref(), &model_po, &prompt_b, &opts_po,
         &work_dir, state, &global_tokens, &global_start,
         SpinnerState::Thinking,
     )?;
@@ -803,11 +843,11 @@ pub fn run_orchestrator(
                 let mut ans = String::new();
                 io::stdin().read_line(&mut ans)?;
                 let ans = ans.trim();
-                if ans.is_empty() {
-                    decisions.push(format!("Q: {} → A: (用户接受默认)", q));
-                } else {
-                    decisions.push(format!("Q: {} → A: {}", q, ans));
-                }
+                decisions.push(format!(
+                    "Q: {} → A: {}",
+                    q,
+                    if ans.is_empty() { "(用户接受默认)" } else { ans }
+                ));
             }
         } else {
             println!("{GREEN}✅ 需求明确，进入分析{RESET}");
@@ -816,20 +856,17 @@ pub fn run_orchestrator(
         println!("{GREEN}✅ 需求明确，进入分析{RESET}");
     }
 
-    let decisions_str = if decisions.is_empty() {
-        "无需额外澄清".to_string()
-    } else {
-        decisions.join("\n")
-    };
+    let decisions_str = if decisions.is_empty() { "无需额外澄清".to_string() } else { decisions.join("\n") };
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // C→J main loop (可从 D 或 I 重启到 C)
-    // ═══════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════
+    // C→J main loop
+    // ══════════════════════════════════════════════════════════════════════
     let mut written_files: HashMap<String, String> = HashMap::new();
     let mut all_completed: Vec<String> = Vec::new();
     let mut compile_ok = true;
     let mut solution_design = String::new();
     let mut restart_count = 0usize;
+    let mut restart_report: Option<MajorRestartReport> = None;
 
     'main_loop: loop {
         if restart_count >= MAX_RESTART {
@@ -842,13 +879,21 @@ pub fn run_orchestrator(
         }
         restart_count += 1;
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Phase C: 分析 — dsr1 设计解决方案（自然语言）
-        // ═══════════════════════════════════════════════════════════════════
+        let model_arch = slot_model(SlotRole::Architect, state);
+        let opts_arch = slot_opts(SlotRole::Architect, &config);
+
+        // ══════════════════════════════════════════════════════════════════
+        // Phase C: Solution Design — Architect
+        // ══════════════════════════════════════════════════════════════════
         println!("{CYAN}【C】方案设计...{RESET}");
 
+        let restart_ctx = restart_report.as_ref()
+            .map(|r| r.format_for_prompt())
+            .unwrap_or_default();
+
         let prompt_c = format!(
-            "{role}## 用户完整需求\n{request}\n\n\
+            "{role}{restart_ctx}\
+            ## 用户完整需求\n{request}\n\n\
             ## 澄清决策\n{decisions}\n\n\
             ## 项目目录\n{tree}\n\n\
             ## 项目规则\n{rules}\n\n\
@@ -858,15 +903,10 @@ pub fn run_orchestrator(
             - [SYSTEM:grep pattern=\"symbol\" path=\"src\"]\n\
             - [SYSTEM:web_search query=\"关键词\"]\n\n\
             请设计完整的解决方案。输出以 [SOLUTION_DESIGN] 开头，自然语言，无字数限制。\n\
-            必须包含：\n\
-            1. 问题理解\n\
-            2. 技术方案（需要执行哪些行为）\n\
-            3. 关键技术决策及理由\n\
-            4. 成功标准（I 阶段将对照此检查）\n\
-            5. 可能的风险点\n\
+            必须包含：1. 问题理解  2. 技术方案  3. 关键技术决策及理由  4. 成功标准  5. 可能的风险点\n\
             注意：此时不拆分模块，不生成代码。只输出方案。\n\
             所有输出用 {lang}。",
-            role = ROLE_DSR1,
+            role = SlotRole::Architect.role_prompt(),
             request = user_request,
             decisions = decisions_str,
             tree = project_tree,
@@ -875,38 +915,34 @@ pub fn run_orchestrator(
         );
 
         let c_raw = call_model(
-            &ollama, DSR1, &prompt_c, &dsr1_opts(),
+            backend.as_ref(), &model_arch, &prompt_c, &opts_arch,
             &work_dir, state, &global_tokens, &global_start,
             SpinnerState::Architecting,
         )?;
 
         solution_design = extract_solution_design(&c_raw);
         println!("{GRAY}  📐 方案设计已生成 ({} chars){RESET}", solution_design.len());
-
-        // Print first few lines of solution for user
         for line in solution_design.lines().take(6) {
-            if !line.trim().is_empty() {
-                println!("  {GRAY}{}{RESET}", line.trim());
-            }
+            if !line.trim().is_empty() { println!("  {GRAY}{}{RESET}", line.trim()); }
         }
         println!();
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Phase D: 深入澄清 — 确认方案方向
-        // ═══════════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════════
+        // Phase D: Direction Check — Architect
+        // ══════════════════════════════════════════════════════════════════
         println!("{CYAN}【D】方向确认...{RESET}");
 
         let prompt_d = format!(
-            "{role}{sol}请检查上述方案，列出最多 2 个关键方向性问题（技术选型、架构风格、存储方案等），\n\
+            "{role}{sol}请检查上述方案，列出最多 2 个关键方向性问题（技术选型、架构风格等），\n\
             或者如果方向已明确，输出 \"✅ 方案方向明确，无需确认\"。\n\
             只问方案中存在真正选择分叉的地方。所有输出用 {lang}。",
-            role = ROLE_DSR1,
+            role = SlotRole::Architect.role_prompt(),
             sol = solution_section(&solution_design),
             lang = output_lang,
         );
 
         let d_raw = call_model(
-            &ollama, DSR1, &prompt_d, &dsr1_opts(),
+            backend.as_ref(), &model_arch, &prompt_d, &opts_arch,
             &work_dir, state, &global_tokens, &global_start,
             SpinnerState::Thinking,
         )?;
@@ -916,9 +952,7 @@ pub fn run_orchestrator(
             if !questions.is_empty() {
                 println!("{CYAN}📐 方案摘要:{RESET}");
                 for line in solution_design.lines().take(4) {
-                    if !line.trim().is_empty() {
-                        println!("  {GRAY}{}{RESET}", line.trim());
-                    }
+                    if !line.trim().is_empty() { println!("  {GRAY}{}{RESET}", line.trim()); }
                 }
                 println!();
 
@@ -930,7 +964,7 @@ pub fn run_orchestrator(
                     let mut ans = String::new();
                     io::stdin().read_line(&mut ans)?;
                     let ans = ans.trim().to_lowercase();
-                    if ans == "n" || ans == "no" || ans == "重来" || ans == "reject" {
+                    if ans == "n" || ans == "no" {
                         rejected = true;
                         break;
                     }
@@ -943,40 +977,39 @@ pub fn run_orchestrator(
                 }
             }
         }
-
         println!("{GREEN}✅ 方案方向确认，进入模块规划{RESET}");
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Phase E: 分段 — dsr1 拆分模块
-        // ═══════════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════════
+        // Phase E: Module Plan — Architect
+        // ══════════════════════════════════════════════════════════════════
         println!("{CYAN}【E】模块规划...{RESET}");
 
         let prompt_e = format!(
             "{role}{sol}## 澄清决策\n{decisions}\n\n\
             请将解决方案拆分为可执行的模块。输出以 [MODULE_PLAN] 开头。\n\n\
-            格式：\n\
-            第一部分：是否需要拆分的判断\n\
-            第二部分：每个子模块（用 [MODULE: 模块名] 标记）：\n\
-            输入规范: xxx\n\
-            输出规范: xxx\n\
-            实现原理: xxx\n\
-            与其他模块的接口: xxx\n\
+            格式（每个子模块用 [MODULE: 模块名] 标记）：\n\
+            inputs: 输入规范\n\
+            outputs: 输出规范\n\
+            constraints:\n\
+              - [HARD] 硬性约束\n\
+              - [SOFT] 软性约束\n\
+            verification:\n\
+              - 验收条件\n\
             needs_compile: true/false\n\
-            assigned_model: QWEN/DSR1\n\
-            第三部分：模块间联动逻辑和依赖顺序\n\n\
+            assigned_slot: Programmer/Architect/SeniorEngineer/QA/ProductOwner\n\n\
             规则：\n\
-            - 文档/分析/论文 → assigned_model=DSR1, needs_compile=false\n\
-            - 代码任务 → assigned_model=QWEN, needs_compile 按需\n\
+            - 文档/分析/论文 → assigned_slot=Architect, needs_compile=false\n\
+            - 代码任务 → assigned_slot=Programmer（默认）或 SeniorEngineer（复杂逻辑）\n\
             - 规范要足够详细，执行模型直接可用\n\
             所有输出用 {lang}。",
-            role = ROLE_DSR1,
+            role = SlotRole::Architect.role_prompt(),
             sol = solution_section(&solution_design),
             decisions = decisions_str,
             lang = output_lang,
         );
 
         let e_raw = call_model(
-            &ollama, DSR1, &prompt_e, &dsr1_opts(),
+            backend.as_ref(), &model_arch, &prompt_e, &opts_arch,
             &work_dir, state, &global_tokens, &global_start,
             SpinnerState::Architecting,
         )?;
@@ -987,12 +1020,13 @@ pub fn run_orchestrator(
         println!("{CYAN}模块列表:{RESET}");
         for (i, m) in modules.iter().enumerate() {
             let kind = if m.needs_compile { "🔨" } else { "📝" };
-            println!("  {GREEN}{}. {}{RESET} {kind}  {GRAY}[{}]{RESET}", i + 1, m.name, m.assigned_model);
+            println!("  {GREEN}{}. {}{RESET} {kind}  {GRAY}[{}]{RESET}", i + 1, m.name, m.assigned_slot.name());
         }
         println!();
 
-        // Confirmation gate (unless /edit is active)
-        if !edit_mode {
+        // Confirmation gate
+        let current_edit_mode = state.lock().unwrap().edit_mode;
+        if !current_edit_mode {
             print!("{CYAN}▶ 执行 {} 个模块? {GRAY}[y=执行 / n=取消 / a=始终执行]: {RESET}", modules.len());
             let _ = io::stdout().flush();
             let mut ans = String::new();
@@ -1004,7 +1038,6 @@ pub fn run_orchestrator(
             }
         }
 
-        // Git checkpoint before Phase F
         if any_compile { ensure_cargo_toml(&work_dir); }
         let checkpoint_info = git_checkpoint(&work_dir, user_request);
         state.lock().unwrap().checkpoint_count += 1;
@@ -1012,48 +1045,31 @@ pub fn run_orchestrator(
         println!("  {GRAY}⎿  {checkpoint_info}{RESET}");
         println!();
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Phase F + G: 制作 + 快速评估（每模块循环）
-        // ═══════════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════════
+        // Phase F + G: Generate + Quick Review (per module)
+        // ══════════════════════════════════════════════════════════════════
         let module_count = modules.len();
         for (mod_idx, module) in modules.iter().enumerate() {
-            println!("{PINK}● 模块 {}/{}: {}{RESET}", mod_idx + 1, module_count, module.name);
+            println!("{PINK}● 模块 {}/{}: {}  [{}]{RESET}",
+                mod_idx + 1, module_count, module.name, module.assigned_slot.name());
 
-            let exec_model = resolve_model(&module.assigned_model);
-            let exec_opts = if exec_model == QWEN { qwen_gen_opts() } else { dsr1_opts() };
-            let role = if exec_model == QWEN { ROLE_QWEN } else { ROLE_DSR1 };
+            let exec_role = module.assigned_slot;
+            let exec_model = slot_model(exec_role, state);
+            let exec_opts = slot_opts(exec_role, &config);
 
             for attempt in 1..=REVIEW_MAX_ATTEMPTS {
-                // ── Phase F: 制作 ──────────────────────────────────────────
-                let gen_prompt = format!(
-                    "{role}{sol}\
-                    ## 原始需求\n{request}\n\n\
-                    ## 本模块规范\n{spec}\n\n\
-                    ## 项目目录\n{tree}\n\n\
-                    ## 可用工具（优先调用再生成）\n\
-                    - [SYSTEM:read_file path=\"path\"]\n\
-                    - [SYSTEM:grep pattern=\"symbol\" path=\"src\"]\n\
-                    - [SYSTEM:web_search query=\"关键词\"]\n\n\
-                    在生成前，先用 [THINK] 输出思考过程：\n\
-                    - 输入是什么 / 输出是什么\n\
-                    - 关键数据结构和函数签名\n\
-                    - 边界情况\n\n\
-                    ## 输出格式（二选一）\n\
-                    小范围修改：\n\
-                    ```patch filename=\"path/to/file\"\n---OLD---\n原始代码\n---NEW---\n修改后\n---END---\n```\n\
-                    新文件或大范围重写：\n\
-                    ```rust filename=\"path/to/file.rs\"\n// 完整代码\n```\n\
-                    所有注释和说明用 {lang}。",
-                    role = role,
-                    sol = solution_section(&solution_design),
-                    request = user_request,
-                    spec = module.full_spec,
-                    tree = project_tree,
-                    lang = output_lang,
+                // ── Phase F: Generate ──────────────────────────────────────
+                let gen_prompt = build_generation_prompt(
+                    module,
+                    &solution_design,
+                    user_request,
+                    &project_tree,
+                    &output_lang,
+                    restart_report.as_ref(),
                 );
 
                 let f_raw = call_model(
-                    &ollama, exec_model, &gen_prompt, &exec_opts,
+                    backend.as_ref(), &exec_model, &gen_prompt, &exec_opts,
                     &work_dir, state, &global_tokens, &global_start,
                     SpinnerState::Crafting,
                 )?;
@@ -1061,9 +1077,7 @@ pub fn run_orchestrator(
                 if let Some(think) = extract_think_block(&f_raw) {
                     println!("{GRAY}  [THINK]{RESET}");
                     for line in think.lines().take(6) {
-                        if !line.trim().is_empty() {
-                            println!("    {GRAY}{}{RESET}", line.trim());
-                        }
+                        if !line.trim().is_empty() { println!("    {GRAY}{}{RESET}", line.trim()); }
                     }
                 }
 
@@ -1074,7 +1088,7 @@ pub fn run_orchestrator(
                     write_or_patch_files(&blocks, &work_dir, &mut written_files, &mut all_completed, any_compile);
                 }
 
-                // ── Phase G: 快速评估 ──────────────────────────────────────
+                // ── Phase G: Quick Review — QA ─────────────────────────────
                 let module_code = {
                     let mut s = String::new();
                     for (fname, content) in &written_files {
@@ -1092,53 +1106,79 @@ pub fn run_orchestrator(
                     2. 拼写错误、语法错误\n\
                     3. 与规范的一致性\n\
                     4. 文件内容是否大幅缩减（行数 < 原来的 30%）\n\n\
-                    用 [REVIEW] 开头。通过输出 ✓，不通过输出 ⚠ + 问题描述。",
-                    role = ROLE_QWEN,
+                    用 [REVIEW] 开头。通过输出 ✓，问题用 [MAJOR]/[MINOR] 标注。\n\
+                    所有输出用 {lang}。",
+                    role = SlotRole::QA.role_prompt(),
                     spec = module.full_spec,
                     code = module_code,
+                    lang = output_lang,
                 );
 
+                let model_qa = slot_model(SlotRole::QA, state);
+                let opts_qa = slot_opts(SlotRole::QA, &config);
+
                 let sp = Spinner::new(SpinnerState::Reviewing, Arc::clone(&global_tokens), Arc::clone(&global_start));
-                let (g_raw, g_usage) = ollama.chat(QWEN, &review_prompt, Some(&qwen_ctx_opts()))?;
-                add_global_tokens(&global_tokens, &g_usage);
+                let (g_raw, g_usage) = backend.generate_complete(&model_qa, &review_prompt, &opts_qa)?;
+                add_tokens(&global_tokens, &g_usage);
                 sp.stop();
                 record_usage(state, &g_usage);
 
+                let review = parse_review_result(&module.name, &g_raw);
+
                 print!("{CYAN}  [G 评估 {attempt}/{REVIEW_MAX_ATTEMPTS}]{RESET} ");
-                if !g_raw.contains('⚠') {
+                if matches!(review.status, ReviewStatus::Approved) {
                     println!("{GREEN}✓ 通过{RESET}");
                     break;
                 }
 
                 println!("{YELLOW}⚠ 发现问题{RESET}");
-                for line in g_raw.lines().filter(|l| l.contains('⚠')).take(3) {
-                    println!("    {YELLOW}{}{RESET}", line.trim());
+                for issue in review.issues.iter().take(3) {
+                    let sev = match issue.severity {
+                        IssueSeverity::Major => format!("{RED}[MAJOR]{RESET}"),
+                        IssueSeverity::Minor => format!("{YELLOW}[MINOR]{RESET}"),
+                        IssueSeverity::Info => format!("{GRAY}[INFO]{RESET}"),
+                    };
+                    println!("    {} {}", sev, issue.description);
                 }
 
                 if attempt == REVIEW_MAX_ATTEMPTS {
                     println!("  {YELLOW}⚠ 达到最大评估次数，继续{RESET}");
                     break;
                 }
-                // Loop back to F with correction context injected into next gen_prompt via written_files state
+
+                // Build structured fix prompt for next F iteration
+                let fix_prompt = build_fix_prompt(
+                    &review,
+                    &module_code,
+                    module,
+                    &solution_design,
+                    &output_lang,
+                );
+                let fix_raw = call_model(
+                    backend.as_ref(), &exec_model, &fix_prompt, &exec_opts,
+                    &work_dir, state, &global_tokens, &global_start,
+                    SpinnerState::Fixing,
+                )?;
+                let fix_blocks = extract_code_blocks(&fix_raw);
+                if !fix_blocks.is_empty() {
+                    write_or_patch_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed, any_compile);
+                }
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Phase H: 合并检查（无模型调用）
-        // ═══════════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════════
+        // Phase H: Merge Check (static, no model)
+        // ══════════════════════════════════════════════════════════════════
         println!("{CYAN}【H】合并检查...{RESET}");
         let mut h_issues = Vec::new();
 
-        // Check all modules produced at least some output
         if written_files.is_empty() {
             h_issues.push("⚠ 未生成任何文件".to_string());
         }
 
-        // Basic interface check: look for undefined symbols in .rs files
         if any_compile {
             for (fname, content) in &written_files {
                 if !fname.ends_with(".rs") { continue; }
-                // Heuristic: warn if use statements reference modules not in written_files
                 for line in content.lines() {
                     let t = line.trim();
                     if t.starts_with("use crate::") {
@@ -1149,10 +1189,10 @@ pub fn run_orchestrator(
                             .unwrap_or("")
                             .trim_end_matches(';');
                         let mod_file = format!("src/{module_name}.rs");
-                        if !written_files.contains_key(&mod_file)
-                            && !work_dir.join(&mod_file).exists()
-                        {
-                            h_issues.push(format!("⚠ {fname} 引用了 crate::{module_name}，但 {mod_file} 未生成也不存在"));
+                        if !written_files.contains_key(&mod_file) && !work_dir.join(&mod_file).exists() {
+                            h_issues.push(format!(
+                                "⚠ {fname} 引用了 crate::{module_name}，但 {mod_file} 未生成也不存在"
+                            ));
                         }
                     }
                 }
@@ -1160,72 +1200,69 @@ pub fn run_orchestrator(
         }
 
         if h_issues.is_empty() {
-            println!("{GREEN}  ✅ 合并检查通过，文件已就绪{RESET}");
+            println!("{GREEN}  ✅ 合并检查通过{RESET}");
         } else {
-            for issue in &h_issues {
-                println!("  {YELLOW}{issue}{RESET}");
-            }
+            for issue in &h_issues { println!("  {YELLOW}{issue}{RESET}"); }
         }
         let h_issues_str = h_issues.join("\n");
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Phase I: 总体评估 — dsr1 对照 C 的成功标准检查
-        // ═══════════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════════
+        // Phase I: Overall Eval — SeniorEngineer (compile) + Architect (review)
+        // ══════════════════════════════════════════════════════════════════
         println!("{CYAN}【I】总体评估...{RESET}");
 
-        // Run cargo check first if needed
+        // Compile/verification loop (SeniorEngineer fixes)
+        let model_se = slot_model(SlotRole::SeniorEngineer, state);
+        let opts_se = slot_opts(SlotRole::SeniorEngineer, &config);
+
         let mut cargo_errors = String::new();
-        if work_dir.join("Cargo.toml").exists() && any_compile && !written_files.is_empty() {
-            println!("{CYAN}  🔍 Cargo check...{RESET}");
-            compile_ok = false;
-            for attempt in 1..=CARGO_FIX_MAX {
-                let (ok, output, _) = executor.run("cargo check 2>&1")?;
-                if ok {
-                    println!("{GREEN}  ✓ 编译通过 (attempt {attempt}){RESET}");
-                    compile_ok = true;
-                    cargo_errors.clear();
-                    break;
-                }
-                let err: String = output.chars().take(1500).collect();
-                println!("{RED}  ✗ 编译失败 (attempt {attempt}){RESET}");
-                for line in output.lines().take(8) {
-                    if line.contains("error") { println!("    {GRAY}{line}{RESET}"); }
-                }
-                if attempt == CARGO_FIX_MAX {
-                    cargo_errors = err.clone();
-                    println!("{RED}  ❌ 编译失败 after {CARGO_FIX_MAX} attempts{RESET}");
-                    break;
-                }
+        if any_compile && !written_files.is_empty() {
+            let (mut ok, mut last_err) = run_verification(&config, &work_dir, &executor, &written_files, any_compile);
+            compile_ok = ok;
 
-                let all_code = build_code_context(&written_files);
-                let fix_prompt = format!(
-                    "{role}{sol}## 编译错误（第 {attempt} 次）\n```\n{err}\n```\n\n\
-                    ## 当前代码\n{all_code}\n\n\
-                    可搜索相关符号：[SYSTEM:grep pattern=\"符号名\" path=\"src\"]\n\n\
-                    ## 输出格式（二选一）\n\
-                    ```patch filename=\"path\"\n---OLD---\n原始\n---NEW---\n修复\n---END---\n```\n\
-                    ```rust filename=\"path\"\n// 完整代码\n```\n\
-                    所有说明用 {lang}。",
-                    role = ROLE_DSR1,
-                    sol = solution_section(&solution_design),
-                    lang = output_lang,
-                );
+            // SeniorEngineer fix loop
+            if !ok {
+                for fix_attempt in 1..=CARGO_FIX_MAX {
+                    let all_code = build_code_context(&written_files);
+                    let fix_prompt = format!(
+                        "{role}{sol}## 编译错误（第 {fix_attempt} 次）\n```\n{err}\n```\n\n\
+                        ## 当前代码\n{all_code}\n\n\
+                        可搜索相关符号：[SYSTEM:grep pattern=\"符号名\" path=\"src\"]\n\n\
+                        ## 输出格式（二选一）\n\
+                        ```patch filename=\"path\"\n---OLD---\n原始\n---NEW---\n修复\n---END---\n```\n\
+                        ```rust filename=\"path\"\n// 完整代码\n```\n\
+                        所有说明用 {lang}。",
+                        role = SlotRole::SeniorEngineer.role_prompt(),
+                        sol = solution_section(&solution_design),
+                        err = last_err,
+                        lang = output_lang,
+                    );
 
-                let fix_raw = call_model(
-                    &ollama, DSR1, &fix_prompt, &dsr1_opts(),
-                    &work_dir, state, &global_tokens, &global_start,
-                    SpinnerState::FixingDsr1,
-                )?;
+                    let fix_raw = call_model(
+                        backend.as_ref(), &model_se, &fix_prompt, &opts_se,
+                        &work_dir, state, &global_tokens, &global_start,
+                        SpinnerState::FixingDsr1,
+                    )?;
 
-                let fix_blocks = extract_code_blocks(&fix_raw);
-                if !fix_blocks.is_empty() {
-                    write_or_patch_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed, true);
+                    let fix_blocks = extract_code_blocks(&fix_raw);
+                    if !fix_blocks.is_empty() {
+                        write_or_patch_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed, true);
+                    }
+
+                    let (ok2, err2) = run_verification(&config, &work_dir, &executor, &written_files, any_compile);
+                    ok = ok2; last_err = err2;
+                    if ok { compile_ok = true; break; }
+                    if fix_attempt == CARGO_FIX_MAX {
+                        cargo_errors = last_err.clone();
+                        println!("{RED}  ❌ 编译失败 after {CARGO_FIX_MAX} attempts{RESET}");
+                    }
                 }
             }
         } else if !written_files.is_empty() && !any_compile {
             println!("{CYAN}  📝 文档任务，跳过编译{RESET}");
         }
 
+        // Architect review
         let all_code_ctx = build_code_context(&written_files);
         let i_prompt = format!(
             "{role}## 解决方案设计（Phase C）\n{sol}\n\n\
@@ -1241,16 +1278,17 @@ pub fn run_orchestrator(
             - [MAJOR] 需要重新生成（可能需要回到 Phase C）\n\
             全部通过输出：[ARCHITECT] ✓ 整体评估通过\n\
             所有输出用 {lang}。",
-            role = ROLE_DSR1,
+            role = SlotRole::Architect.role_prompt(),
             sol = solution_design,
             h_issues = if h_issues_str.is_empty() { "无".to_string() } else { h_issues_str.clone() },
-            compile_status = if compile_ok { "✓ 编译通过".to_string() } else { format!("✗ 编译失败\n{cargo_errors}") },
+            compile_status = if compile_ok { "✓ 编译通过".to_string() }
+                             else { format!("✗ 编译失败\n{cargo_errors}") },
             code = all_code_ctx,
             lang = output_lang,
         );
 
         let i_raw = call_model(
-            &ollama, DSR1, &i_prompt, &dsr1_opts(),
+            backend.as_ref(), &model_arch, &i_prompt, &opts_arch,
             &work_dir, state, &global_tokens, &global_start,
             SpinnerState::Evaluating,
         )?;
@@ -1258,15 +1296,10 @@ pub fn run_orchestrator(
         for line in i_raw.lines().take(20) {
             let t = line.trim();
             if t.is_empty() { continue; }
-            if t.contains("[MAJOR]") {
-                println!("  {RED}{t}{RESET}");
-            } else if t.contains("[MINOR]") {
-                println!("  {YELLOW}{t}{RESET}");
-            } else if t.starts_with("[ARCHITECT]") {
-                println!("  {CYAN}{t}{RESET}");
-            } else {
-                println!("  {GRAY}{t}{RESET}");
-            }
+            if t.contains("[MAJOR]") { println!("  {RED}{t}{RESET}"); }
+            else if t.contains("[MINOR]") { println!("  {YELLOW}{t}{RESET}"); }
+            else if t.starts_with("[ARCHITECT]") { println!("  {CYAN}{t}{RESET}"); }
+            else { println!("  {GRAY}{t}{RESET}"); }
         }
 
         if i_raw.contains("[MAJOR]") {
@@ -1275,6 +1308,18 @@ pub fn run_orchestrator(
             let mut ans = String::new();
             io::stdin().read_line(&mut ans)?;
             if ans.trim().to_lowercase() == "y" || ans.trim().to_lowercase() == "yes" {
+                // Build restart report for next C iteration
+                let major_issues: Vec<String> = i_raw.lines()
+                    .filter(|l| l.contains("[MAJOR]"))
+                    .map(|l| l.trim().to_string())
+                    .collect();
+                restart_report = Some(MajorRestartReport {
+                    triggered_by: Some(SlotRole::Architect),
+                    reason: major_issues.first().cloned().unwrap_or_else(|| "架构评审发现重大问题".to_string()),
+                    attempted_fixes: vec![],
+                    constraints_for_redesign: vec![],
+                    preserved_artifacts: all_completed.clone(),
+                });
                 println!("{CYAN}↩ 回到 Phase C...{RESET}");
                 continue 'main_loop;
             }
@@ -1286,9 +1331,8 @@ pub fn run_orchestrator(
             let rework_prompt = format!(
                 "{role}{sol}## 评估意见\n{feedback}\n\n\
                 ## 当前代码\n{code}\n\n\
-                请修复所有 [MINOR] 问题。输出修改后的文件。\n\
-                所有说明用 {lang}。",
-                role = ROLE_DSR1,
+                请修复所有 [MINOR] 问题，输出修改后的文件。所有说明用 {lang}。",
+                role = SlotRole::SeniorEngineer.role_prompt(),
                 sol = solution_section(&solution_design),
                 feedback = i_raw,
                 code = build_code_context(&written_files),
@@ -1296,7 +1340,7 @@ pub fn run_orchestrator(
             );
 
             let rework_raw = call_model(
-                &ollama, DSR1, &rework_prompt, &dsr1_opts(),
+                backend.as_ref(), &model_se, &rework_prompt, &opts_se,
                 &work_dir, state, &global_tokens, &global_start,
                 SpinnerState::FixingDsr1,
             )?;
@@ -1311,17 +1355,14 @@ pub fn run_orchestrator(
             println!("{GREEN}✓ 总体评估通过{RESET}");
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Phase J: 总结收束
-        // ═══════════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════════
+        // Phase J: Wrap-up — ProductOwner
+        // ══════════════════════════════════════════════════════════════════
         println!();
         print_change_summary(&all_completed);
 
-        // Update .sakichan.md
-        let modules_summary = modules
-            .iter()
-            .enumerate()
-            .map(|(i, m)| format!("{}. {} [{}]", i + 1, m.name, m.assigned_model))
+        let modules_summary = modules.iter().enumerate()
+            .map(|(i, m)| format!("{}. {} [{}]", i + 1, m.name, m.assigned_slot.name()))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -1330,22 +1371,20 @@ pub fn run_orchestrator(
             "## 本次完成的工作\n{modules_summary}\n\n\
             ## 当前 .sakichan.md\n{current_rules}\n\n\
             请更新项目规则文件，保留原有信息，追加本次发现。\n\
-            输出用 [RULES_UPDATE] 标记。",
+            输出用 [RULES_UPDATE] 标记。"
         );
 
         let sp = Spinner::new(SpinnerState::Thinking, Arc::clone(&global_tokens), Arc::clone(&global_start));
-        let rules_updated = match ollama.chat(DSR1, &rules_prompt, Some(&dsr1_opts())) {
+        let rules_updated = match backend.generate_complete(&model_po, &rules_prompt, &opts_po) {
             Ok((rules_raw, usage_ru)) => {
-                add_global_tokens(&global_tokens, &usage_ru);
+                add_tokens(&global_tokens, &usage_ru);
                 sp.stop();
                 record_usage(state, &usage_ru);
                 if let Some(new_rules) = extract_rules_update(&rules_raw) {
                     let ok = fs::write(work_dir.join(".sakichan.md"), &new_rules).is_ok();
                     if ok { println!("{GRAY}📄 规则文件已更新{RESET}"); }
                     ok
-                } else {
-                    false
-                }
+                } else { false }
             }
             Err(_) => { sp.stop(); false }
         };
@@ -1369,7 +1408,7 @@ pub fn run_orchestrator(
             &all_completed,
             compile_ok,
             &[],
-            DSR1,
+            &model_arch,
             global_start.elapsed().as_secs_f64(),
         );
 

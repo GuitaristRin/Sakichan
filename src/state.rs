@@ -1,21 +1,11 @@
-use crate::ollama::UsageStats;
+use crate::backend::UsageStats;
+use crate::config::SakichanConfig;
 use anyhow::Result;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DailyUsage {
-    #[serde(flatten)]
-    pub stats: UsageStats,
-    // We re-export the fields for convenience
-    #[serde(skip)]
-    pub input_tokens: u64,
-    #[serde(skip)]
-    pub output_tokens: u64,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PersistUsage {
@@ -37,8 +27,8 @@ impl PersistUsage {
 }
 
 pub struct AppState {
-    pub ollama_host: String,
-    pub current_model: String,
+    pub config: SakichanConfig,
+    pub slot_assignments: HashMap<String, String>,
     pub edit_mode: bool,
     pub lang: String,
     pub work_dir: PathBuf,
@@ -48,14 +38,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(work_dir: PathBuf) -> Self {
+    pub fn new(work_dir: PathBuf, config: SakichanConfig) -> Self {
         let usage_file = work_dir.join(".sakichan").join("usage.json");
         let usage = Self::load_usage(&usage_file);
+        let edit_mode = config.general.edit_mode;
+        let lang = config.general.lang.clone();
         AppState {
-            ollama_host: "localhost:11434".to_string(),
-            current_model: "qwen2.5-coder:7b".to_string(),
-            edit_mode: false,
-            lang: "zh_TW".to_string(),
+            config,
+            slot_assignments: HashMap::new(),
+            edit_mode,
+            lang,
             work_dir,
             usage,
             usage_file,
@@ -87,5 +79,9 @@ impl AppState {
         let data = serde_json::to_string_pretty(context)?;
         fs::write(session_file, data)?;
         Ok(())
+    }
+
+    pub fn ollama_host(&self) -> &str {
+        &self.config.backend.ollama.host
     }
 }

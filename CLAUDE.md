@@ -15,64 +15,82 @@ No test suite exists yet. Lint: `cargo check` doubles as the lint step; no clipp
 
 ## Architecture
 
-Sakichan is a Rust CLI that wraps a local Ollama instance into a five-phase AI coding assistant. The user types a free-form request; the orchestrator drives two models through analysis, planning, code generation, and compilation until `cargo check` passes.
+Sakichan is a Rust CLI (v0.3.0) that wraps a local Ollama instance into a ten-phase AI coding assistant. The user types a free-form request; the orchestrator drives two models through requirement analysis, solution design, module planning, code generation, and compilation until `cargo check` passes.
 
 ### Two models, fixed roles
 
 | Constant | Role | Value | Responsibility |
 |---|---|---|---|
-| `DSR1` | Engineer & Architect | `deepseek-r1:8b` | Analysis (Phase 1), planning (Phase 3), architect check (4c/4d), compile fix (4e), doc writing |
-| `QWEN` | Programmer | `qwen2.5-coder:7b` | Context extraction (Phase 0), code generation (Phase 4a QWEN steps), code review (4b) |
+| `DSR1` | Engineer & Architect | `deepseek-r1:8b` | Solution design (C), direction confirmation (D), module planning (E), compile fix (I), overall evaluation (I), rules update (J) |
+| `QWEN` | Programmer | `qwen2.5-coder:7b` | Request summarization (A), clarification (B), code generation (F), quick review (G) |
 
 Role constants: `ROLE_DSR1` and `ROLE_QWEN` are prepended to each model's prompts to enforce role identity.
 
-Each plan step carries an `assigned_model` field (`"QWEN"` or `"DSR1"`); `resolve_model()` maps this string to the actual model constant. The user's `state.current_model` field is stored but does not affect which model runs — model selection is fully driven by the plan.
+Each module carries an `assigned_model` field (`"QWEN"` or `"DSR1"`); `resolve_model()` maps this to the actual model constant. `state.current_model` is stored but does not affect model selection — it is fully driven by the module plan.
 
 ### Model option presets (`src/orchestrator.rs`)
 
-Three named presets tune inference per use-case:
-
 | Preset | temp | Used for |
 |---|---|---|
-| `dsr1_opts()` | 0.3 | All DSR1 calls (analysis, planning, architect, compile-fix) |
-| `qwen_ctx_opts()` | 0.1 | Phase 0 context extraction, Phase 4b review |
-| `qwen_gen_opts()` | 0.2 | Phase 4a code generation (QWEN steps) |
+| `dsr1_opts()` | 0.3 | All DSR1 calls |
+| `qwen_ctx_opts()` | 0.1 | Phase A summarization, Phase G review |
+| `qwen_gen_opts()` | 0.2 | Phase F code generation (QWEN steps) |
 
-### Five-phase orchestration (`src/orchestrator.rs`)
-
-```
-Phase 0  gather_context()   – qwen extracts filenames from request, reads them, enriches prompt
-Phase 1  Analysis           – DSR1 returns JSON: understanding, task_type (free-form), task_category
-                               (new_project|modify_project|document|analysis|other), complexity 1-10,
-                               gathered_info[], clarifications[]
-Phase 2  Clarification      – shows gathered_info; up to 3 inline questions; extras auto-answered
-Phase 3  Planning           – DSR1 produces steps[]: id, name, submodule_prompt, assigned_model,
-                               files_to_create, verification
-Phase 4  Execution          – per-step generate → review → fix loop, then architect check, then
-                               cargo check fix loop (Rust only)
-Phase 5  Wrap-up            – updates .sakichan.md and build.log; saves session JSON
-```
-
-#### Phase 4 sub-stages and retry limits
+### Ten-phase orchestration (`src/orchestrator.rs`)
 
 ```
-4a  Generate    – exec_model (from step.assigned_model) generates code
-4b  Review      – QWEN reviews; up to REVIEW_MAX_ATTEMPTS=3 fix iterations per step
-4c  Architect   – DSR1 checks cross-module interface correctness
-4d  Rework      – DSR1 fixes issues flagged [MINOR]/[MAJOR]; up to ARCH_MAX_ITERATIONS=2
-4e  Compile     – cargo check; up to CARGO_FIX_MAX=5 DSR1 fix iterations (Rust only)
+Phase A  Summarize        – QWEN summarizes user request + project tree into a brief
+Phase B  Clarification    – DSR1 asks up to 3 high-impact questions; extras auto-accepted
+Phase C  Solution design  – DSR1 outputs [SOLUTION_DESIGN] (natural language, no code yet)
+Phase D  Direction check  – DSR1 asks up to 2 fork questions; user can enter 'n' to restart C
+Phase E  Module plan      – DSR1 outputs [MODULE_PLAN] with [MODULE: name] blocks
+Phase F  Generation       – exec_model generates code per module (patch or full-file)
+Phase G  Quick review     – QWEN checks against module spec; up to REVIEW_MAX_ATTEMPTS=3
+Phase H  Merge check      – static check (no model): missing files, unresolved crate:: refs
+Phase I  Overall eval     – cargo check (CARGO_FIX_MAX=5 DSR1 iterations); DSR1 architect
+                             check; [MINOR] rework pass; [MAJOR] prompts restart to C
+Phase J  Wrap-up          – updates .sakichan.md, writes build.log, saves session JSON,
+                             git commits
 ```
 
-Phase 4 suppresses `cargo check` failure output — errors go silently back into the prompt; only `✓ 编译通过` or `❌ 编译失败 after N attempts` is shown.
+Phases C–J run in a `'main_loop` that can restart up to `MAX_RESTART=3` times. Restart is triggered either by the user rejecting a [MAJOR] issue in Phase I, or by pressing `n` at the Phase D direction prompt.
+
+#### Phase F/G retry and Phase I fix limits
+
+```
+F/G loop  Generate → Review → (fix and loop back)  up to REVIEW_MAX_ATTEMPTS=3 per module
+I compile  cargo check → DSR1 fix                   up to CARGO_FIX_MAX=5 iterations
+```
+
+Phase I suppresses raw `cargo check` output — first 8 `error` lines are shown; only `✓ 编译通过` or `❌ 编译失败 after N attempts` is the final verdict.
+
+### Module plan format
+
+Phase E produces text with these markers (parsed by `parse_modules()`):
+
+```
+[MODULE_PLAN]
+[MODULE: 模块名]
+inputs: ...
+outputs: ...
+needs_compile: true/false
+assigned_model: QWEN/DSR1
+...
+```
+
+If no `[MODULE:]` markers are found, the full plan text is wrapped in a single fallback module.
 
 ### Key invariants
 
-- **Confirmation gate.** After Phase 3 (plan displayed), Sakichan always asks `[y/n/a]` before Phase 4 unless `edit_mode=true`. `y` = execute once; `n` = cancel; `a` = set `edit_mode=true` (equivalent to `/edit`, no further prompts). `/edit` command toggles `edit_mode` persistently for the session.
-- **Compilation gate.** Each compile attempt only proceeds if `cargo check` passes; on failure, the error text (≤1500 chars) is appended to the prompt and retried.
+- **Confirmation gate.** After Phase E (module list displayed), Sakichan always asks `[y=执行 / n=取消 / a=始终执行]` before Phase F unless `edit_mode=true`. `a` sets `edit_mode=true` for the session (equivalent to `/edit`).
+- **Source-file guards.** `write_or_patch_files()` rejects writes to source files if: (a) the first 10 lines look like markdown prose, or (b) new content is less than 30% of the existing line count.
+- **Patch format.** Code blocks with lang `patch` use `---OLD--- / ---NEW--- / ---END---` markers; `apply_patch()` does verbatim substring replacement. Falls back to full write on mismatch.
+- **Compilation gate.** `cargo check` runs in Phase I only when `any_compile=true`; on failure the error text (≤1500 chars) is appended to the fix prompt.
 - **Executor safety.** `src/executor.rs` blocks dangerous command strings (`rm -rf /`, `diskpart`, etc.) before spawning any shell.
 - **Environment header.** Every AI prompt starts with a Windows 11 / PowerShell environment declaration, even though the host is Linux — this is intentional for the *target* environment the generated code runs in.
-- **Git checkpoint.** One `git add -A && git commit` fires at the start of Phase 4 (before any file writes). `/undo [n]` runs `git reset --hard HEAD~n` to revert.
-- **SYSTEM tags.** AI responses may emit `[SYSTEM:read_file path="..."]` or `[SYSTEM:list_files path="..."]`; `process_system_calls()` in the orchestrator intercepts and resolves these before parsing.
+- **Git checkpoints.** One `git add -A && git commit` fires at the start of Phase F (before any file writes). `/undo [n]` runs `git reset --hard HEAD~n` to revert. A second commit fires at Phase J.
+- **SYSTEM tags.** AI responses may emit `[SYSTEM:read_file path="..."]`, `[SYSTEM:list_files path="..."]`, `[SYSTEM:grep pattern="..." path="..."]`, or `[SYSTEM:web_search query="..."]`; `process_system_calls()` in `call_model()` intercepts, resolves, and injects results into a follow-up prompt before returning.
+- **Web search.** Uses DuckDuckGo Instant Answer API (`api.duckduckgo.com`), truncated to 1000 chars.
 
 ### Persistence layout (created at runtime)
 
@@ -95,16 +113,16 @@ Languages: `zh_TW` (default) and `en`. The `t()` helper resolves i18n keys at ru
 
 | File | Role |
 |---|---|
-| `main.rs` | REPL loop, Ollama connection check, routes `/commands` vs orchestrator |
+| `main.rs` | REPL loop, Ollama connection check, git status display, routes `/commands` vs orchestrator |
 | `commands.rs` | 16 slash commands + bilingual i18n (zh_TW default, en alternative) |
-| `display.rs` | Color constants, animated `Spinner` (shows elapsed time + tokens), `print_cmd_result` |
-| `orchestrator.rs` | All five phases; model option presets; `gather_context`, JSON parsing, code-block extraction |
+| `display.rs` | Color constants, animated `Spinner` (shows elapsed time + tokens), `print_cmd_result`, `print_code_diff`, `print_change_summary` |
+| `orchestrator.rs` | All ten phases; model option presets; `gather_context`, `parse_modules`, `write_or_patch_files`, `apply_patch`, JSON/code-block extraction, `call_model` |
 | `state.rs` | `AppState` (host, model, lang, edit_mode, usage, checkpoint_count); JSON persistence helpers |
-| `ollama.rs` | Blocking HTTP to `/api/generate` (streaming), `/api/tags`; 300 s timeout |
+| `ollama.rs` | Blocking streaming HTTP to `/api/generate`; `/api/tags`; 300 s timeout |
 | `executor.rs` | Cross-platform shell runner; returns `(ok, output, secs)` |
 | `logger.rs` | Append-only markdown log in `.sakichan/build.log` |
 | `rules.rs` | `.sakichan.md` load/create/update |
 
-### JSON parsing
+### Parsing utilities
 
-`parse_json_from_response` does bracket-depth counting to extract the first `{…}` block from raw model output (models often wrap JSON in prose or `<think>` tags). `extract_code_blocks` handles both ` ```lang filename="path" ` and bare ` ```lang ` fences with filename inference fallback.
+`parse_json_from_response` does bracket-depth counting to extract the first `{…}` block from raw model output (models often wrap JSON in prose or `<think>` tags). `extract_code_blocks` handles both ` ```lang filename="path" ` and bare ` ```lang ` fences with filename inference fallback (detects `[package]`/`fn main`/first `.rs` mention).
