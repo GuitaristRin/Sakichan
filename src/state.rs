@@ -7,6 +7,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Default)]
+pub struct DetectedTool {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PersistUsage {
     pub daily: HashMap<String, UsageStats>,
@@ -29,6 +36,7 @@ impl PersistUsage {
 pub struct AppState {
     pub config: SakichanConfig,
     pub slot_assignments: HashMap<String, String>,
+    pub toolchain_info: Vec<DetectedTool>,
     pub edit_mode: bool,
     pub lang: String,
     pub work_dir: PathBuf,
@@ -46,6 +54,7 @@ impl AppState {
         AppState {
             config,
             slot_assignments: HashMap::new(),
+            toolchain_info: Vec::new(),
             edit_mode,
             lang,
             work_dir,
@@ -83,5 +92,21 @@ impl AppState {
 
     pub fn ollama_host(&self) -> &str {
         &self.config.backend.ollama.host
+    }
+
+    pub fn toolchain_prompt_section(&self) -> String {
+        if self.toolchain_info.is_empty() {
+            return String::new();
+        }
+        let mut s = "## 当前环境可用工具\n".to_string();
+        for t in &self.toolchain_info {
+            if t.version.is_empty() {
+                s.push_str(&format!("- {}: {}\n", t.name, t.description));
+            } else {
+                s.push_str(&format!("- {} {}: {}\n", t.name, t.version, t.description));
+            }
+        }
+        s.push('\n');
+        s
     }
 }

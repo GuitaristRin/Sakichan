@@ -241,6 +241,15 @@ fn has_files_with_ext(dir: &Path, ext: &str) -> bool {
     false
 }
 
+// ── Toolchain ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ToolchainEntry {
+    pub name: String,
+    pub check_command: String,
+    pub description: String,
+}
+
 // ── Top-level config ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -257,6 +266,8 @@ pub struct SakichanConfig {
     pub slot_presets: HashMap<String, String>,
     #[serde(default, rename = "verification")]
     pub verification: Vec<VerificationStrategy>,
+    #[serde(default)]
+    pub toolchain: Vec<ToolchainEntry>,
 }
 
 impl Default for SakichanConfig {
@@ -267,6 +278,7 @@ impl Default for SakichanConfig {
             slots: HashMap::new(),
             presets: HashMap::new(),
             slot_presets: HashMap::new(),
+            toolchain: Vec::new(),
             verification: vec![
                 VerificationStrategy {
                     detector: Detector::FileExists {

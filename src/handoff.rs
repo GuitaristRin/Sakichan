@@ -119,6 +119,136 @@ impl MajorRestartReport {
     }
 }
 
+// ── Unified SAKICHAN tag parser ───────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum SakichanTag {
+    Module {
+        name: String,
+        slot: String,
+        compile: bool,
+        inputs: Vec<String>,
+        outputs: Vec<String>,
+        constraints: Vec<Constraint>,
+        verification: Vec<String>,
+        raw: String,
+    },
+}
+
+pub fn parse_sakichan_tags(raw: &str) -> Vec<SakichanTag> {
+    let mut tags = Vec::new();
+    let mut pos = 0;
+
+    while pos < raw.len() {
+        let slice = &raw[pos..];
+        let Some(rel_start) = slice.find("<SAKICHAN:MODULE") else { break };
+        let abs_start = pos + rel_start;
+        let rest = &raw[abs_start..];
+
+        let tag_end = match rest.find('>') {
+            Some(i) => i,
+            None => { pos = abs_start + 1; continue; }
+        };
+        let opening = &rest[..tag_end + 1];
+
+        let name = parse_sakichan_attr(opening, "name").unwrap_or_default();
+        let slot = parse_sakichan_attr(opening, "slot").unwrap_or_else(|| "Programmer".to_string());
+        let compile = parse_sakichan_attr(opening, "compile").map_or(true, |v| v != "false");
+
+        let content_start = abs_start + tag_end + 1;
+        let close_tag = "</SAKICHAN:MODULE>";
+        match raw[content_start..].find(close_tag) {
+            Some(close_rel) => {
+                let content = &raw[content_start..content_start + close_rel];
+                let tag_raw = raw[abs_start..content_start + close_rel + close_tag.len()].to_string();
+                tags.push(SakichanTag::Module {
+                    name,
+                    slot,
+                    compile,
+                    inputs: extract_sakichan_section(content, "INPUT"),
+                    outputs: extract_sakichan_section(content, "OUTPUT"),
+                    constraints: extract_sakichan_constraints(content),
+                    verification: extract_sakichan_section(content, "VERIFY"),
+                    raw: tag_raw,
+                });
+                pos = content_start + close_rel + close_tag.len();
+            }
+            None => { pos = abs_start + 1; }
+        }
+    }
+    tags
+}
+
+pub fn sakichan_tag_to_module(tag: SakichanTag) -> Module {
+    match tag {
+        SakichanTag::Module { name, slot, compile, inputs, outputs, constraints, verification, raw } => {
+            let assigned_slot = SlotRole::from_str(&slot).unwrap_or(SlotRole::Programmer);
+            Module {
+                name,
+                inputs,
+                outputs,
+                implementation: String::new(),
+                constraints,
+                verification,
+                assigned_slot,
+                needs_compile: compile,
+                full_spec: raw,
+            }
+        }
+    }
+}
+
+fn parse_sakichan_attr(tag: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{}=\"", attr);
+    tag.find(&pattern).map(|start| {
+        let rest = &tag[start + pattern.len()..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        rest[..end].to_string()
+    })
+}
+
+fn extract_sakichan_section(content: &str, tag_name: &str) -> Vec<String> {
+    let open = format!("<SAKICHAN:{}>", tag_name);
+    let close = format!("</SAKICHAN:{}>", tag_name);
+    let Some(start) = content.find(&open) else { return Vec::new() };
+    let after = &content[start + open.len()..];
+    let end = after.find(&close).unwrap_or(after.len());
+    after[..end].lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn extract_sakichan_constraints(content: &str) -> Vec<Constraint> {
+    let mut constraints = Vec::new();
+    let mut pos = 0;
+    let open = "<SAKICHAN:CONSTRAINT";
+    let close = "</SAKICHAN:CONSTRAINT>";
+    while pos < content.len() {
+        let Some(rel) = content[pos..].find(open) else { break };
+        let abs = pos + rel;
+        let Some(tag_end) = content[abs..].find('>') else { pos = abs + 1; continue };
+        let tag_part = &content[abs..abs + tag_end + 1];
+        let ctype = parse_sakichan_attr(tag_part, "type").unwrap_or_else(|| "SOFT".to_string());
+        let cs = abs + tag_end + 1;
+        match content[cs..].find(close) {
+            Some(close_rel) => {
+                let inner = content[cs..cs + close_rel].trim().to_string();
+                if !inner.is_empty() {
+                    constraints.push(match ctype.to_uppercase().as_str() {
+                        "HARD" => Constraint::Hard(inner),
+                        "INFO" => Constraint::Info(inner),
+                        _ => Constraint::Soft(inner),
+                    });
+                }
+                pos = cs + close_rel + close.len();
+            }
+            None => { pos = abs + 1; }
+        }
+    }
+    constraints
+}
+
 // ── Prompt builders ───────────────────────────────────────────────────────────
 
 pub fn build_generation_prompt(
@@ -128,6 +258,7 @@ pub fn build_generation_prompt(
     project_tree: &str,
     output_lang: &str,
     restart_report: Option<&MajorRestartReport>,
+    toolchain_section: &str,
 ) -> String {
     let role = module.assigned_slot;
     let constraints_str = if module.constraints.is_empty() {
@@ -160,6 +291,7 @@ pub fn build_generation_prompt(
         {constraints_str}\
         {verification_str}\
         ## 项目目录\n{tree}\n\n\
+        {toolchain}\
         可用工具（优先调用再生成）：\n\
         - [SYSTEM:read_file path=\"path\"]\n\
         - [SYSTEM:grep pattern=\"symbol\" path=\"src\"]\n\
@@ -176,6 +308,7 @@ pub fn build_generation_prompt(
         request = user_request,
         spec = module.full_spec,
         tree = project_tree,
+        toolchain = toolchain_section,
         lang = output_lang,
     )
 }

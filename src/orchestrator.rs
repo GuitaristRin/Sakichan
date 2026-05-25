@@ -3,13 +3,13 @@ use crate::config::SakichanConfig;
 use crate::display::*;
 use crate::executor::Executor;
 use crate::handoff::{
-    self, build_fix_prompt, build_generation_prompt, Constraint, Issue, IssueSeverity,
-    MajorRestartReport, Module, ReviewResult, ReviewStatus,
+    build_fix_prompt, build_generation_prompt, parse_sakichan_tags, sakichan_tag_to_module,
+    Constraint, Issue, IssueSeverity, MajorRestartReport, Module, ReviewResult, ReviewStatus,
 };
 use crate::logger::Logger;
 use crate::rules::RulesManager;
 use crate::slots::SlotRole;
-use crate::state::AppState;
+use crate::state::{AppState, DetectedTool};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
@@ -52,6 +52,7 @@ fn call_model(
     spin: SpinnerState,
 ) -> Result<String> {
     let spinner = Spinner::new(spin, Arc::clone(global_tokens), Arc::clone(global_start));
+    spinner.set_hint(model);
     let (raw, usage) = backend.generate_complete(model, prompt, opts)?;
     add_tokens(global_tokens, &usage);
     spinner.stop();
@@ -97,6 +98,13 @@ fn slot_opts(role: SlotRole, config: &SakichanConfig) -> ModelOptions {
 // ── Module parsing ────────────────────────────────────────────────────────────
 
 fn parse_modules(plan_text: &str) -> Vec<Module> {
+    // Try SAKICHAN markup first
+    let sakichan = parse_sakichan_tags(plan_text);
+    if !sakichan.is_empty() {
+        return sakichan.into_iter().map(sakichan_tag_to_module).collect();
+    }
+
+    // Fall back to legacy [MODULE:] format
     let text = plan_text
         .find("[MODULE_PLAN]")
         .map(|p| &plan_text[p + "[MODULE_PLAN]".len()..])
@@ -495,15 +503,9 @@ fn write_or_patch_files(
     work_dir: &Path,
     written_files: &mut HashMap<String, String>,
     all_completed: &mut Vec<String>,
-    allow_source: bool,
 ) {
-    const SRC_EXTS: &[&str] = &["rs", "py", "cpp", "c", "go", "js", "ts", "java"];
     for (lang, filename, code) in blocks {
         if filename.is_empty() { continue; }
-        if !allow_source && SRC_EXTS.iter().any(|e| filename.ends_with(&format!(".{e}"))) {
-            println!("{YELLOW}  ⚠ 非编译任务跳过源代码文件 {filename}{RESET}");
-            continue;
-        }
         if lang == "patch" {
             let old_snap = written_files.get(filename).cloned()
                 .or_else(|| fs::read_to_string(work_dir.join(filename)).ok())
@@ -528,8 +530,10 @@ fn write_or_patch_files(
             }
         } else {
             let fpath = work_dir.join(filename);
-            let is_src = SRC_EXTS.iter().any(|e| filename.ends_with(&format!(".{e}")));
-            if is_src && fpath.exists() {
+            // Read existing content once for both guards and diff
+            let old_content = fs::read_to_string(&fpath).unwrap_or_default();
+            if !old_content.is_empty() {
+                // Guard 1: markdown prose overwrite prevention
                 let looks_prose = code.lines().take(10).any(|l| {
                     let t = l.trim();
                     t.starts_with("# ") || t.starts_with("## ") || t.starts_with("---")
@@ -539,7 +543,7 @@ fn write_or_patch_files(
                     println!("{YELLOW}  ⚠ 文档内容试图覆盖 {filename}，已跳过{RESET}");
                     continue;
                 }
-                let old_content = fs::read_to_string(&fpath).unwrap_or_default();
+                // Guard 2: shrink protection (< 30% of original)
                 let old_lines = old_content.lines().count();
                 let new_lines = code.lines().count();
                 if old_lines > 10 && new_lines < old_lines * 30 / 100 {
@@ -547,7 +551,6 @@ fn write_or_patch_files(
                     continue;
                 }
             }
-            let old_content = fs::read_to_string(&fpath).unwrap_or_default();
             if let Some(p) = fpath.parent() { let _ = fs::create_dir_all(p); }
             let _ = fs::write(&fpath, code);
             print_code_diff(filename, &old_content, code);
@@ -692,62 +695,89 @@ fn git_checkpoint(work_dir: &Path, description: &str) -> String {
 
 // ── Phase I: verification strategy ───────────────────────────────────────────
 
+fn detect_verification_command(
+    written_files: &HashMap<String, String>,
+    toolchain: &[DetectedTool],
+) -> Option<String> {
+    let has_tool = |name: &str| toolchain.iter().any(|t| t.name == name);
+    let has_ext  = |ext: &str| written_files.keys().any(|f| f.ends_with(ext));
+
+    if has_ext(".rs") && has_tool("cargo") {
+        return Some("cargo check 2>&1".to_string());
+    }
+    if has_ext(".py") {
+        if has_tool("python3") {
+            let files: Vec<_> = written_files.keys().filter(|f| f.ends_with(".py")).cloned().collect();
+            return Some(format!("python3 -m py_compile {} 2>&1", files.join(" ")));
+        } else if has_tool("python") {
+            let files: Vec<_> = written_files.keys().filter(|f| f.ends_with(".py")).cloned().collect();
+            return Some(format!("python -m py_compile {} 2>&1", files.join(" ")));
+        }
+    }
+    if (has_ext(".ts") || has_ext(".tsx")) && has_tool("tsc") {
+        return Some("tsc --noEmit 2>&1".to_string());
+    }
+    if has_ext(".go") && has_tool("go") {
+        return Some("go build ./... 2>&1".to_string());
+    }
+    if has_ext(".zig") && has_tool("zig") {
+        let files: Vec<_> = written_files.keys().filter(|f| f.ends_with(".zig")).cloned().collect();
+        return Some(format!("zig ast-check {} 2>&1", files.join(" ")));
+    }
+    None
+}
+
 fn run_verification(
     config: &SakichanConfig,
     work_dir: &Path,
     executor: &Executor,
     written_files: &HashMap<String, String>,
     any_compile: bool,
+    toolchain: &[DetectedTool],
 ) -> (bool, String) {
     if !any_compile || written_files.is_empty() {
         return (true, String::new());
     }
 
-    let strategy = config.verification.iter()
-        .find(|v| v.detector.matches(work_dir));
+    // Config [[verification]] entries are custom overrides; auto-detect otherwise
+    let custom = config.verification.iter()
+        .find(|v| v.detector.matches(work_dir) && v.command.is_some());
 
-    let Some(strategy) = strategy else {
-        println!("{GRAY}  ℹ️  无匹配的验证策略，跳过自动化验证{RESET}");
-        return (true, String::new());
-    };
-
-    println!("{CYAN}  🔍 验证策略: {}{RESET}", strategy.name);
-
-    let Some(cmd) = &strategy.command else {
-        println!("{GRAY}  ℹ️  此策略仅架构审查，无自动化命令{RESET}");
-        return (true, String::new());
-    };
-
-    let full_cmd = if strategy.args.is_empty() {
-        cmd.clone()
-    } else {
-        format!("{} {} 2>&1", cmd, strategy.args.join(" "))
-    };
-
-    let mut compile_ok = false;
-    let mut last_errors = String::new();
-
-    for attempt in 1..=CARGO_FIX_MAX {
-        let (ok, output, _) = match executor.run(&full_cmd) {
-            Ok(r) => r,
-            Err(e) => { println!("{RED}  ✗ 验证命令失败: {e}{RESET}"); break; }
-        };
-        if ok {
-            println!("{GREEN}  ✓ 编译通过 (attempt {attempt}){RESET}");
-            compile_ok = true;
-            last_errors.clear();
-            break;
+    let full_cmd = if let Some(strat) = custom {
+        let cmd = strat.command.as_deref().unwrap();
+        println!("{CYAN}  🔍 验证策略: {} (自定义){RESET}", strat.name);
+        if strat.args.is_empty() {
+            cmd.to_string()
+        } else {
+            format!("{} {} 2>&1", cmd, strat.args.join(" "))
         }
-        last_errors = output.chars().take(1500).collect();
-        println!("{RED}  ✗ 编译失败 (attempt {attempt}){RESET}");
+    } else if let Some(cmd) = detect_verification_command(written_files, toolchain) {
+        println!("{CYAN}  🔍 自动检测验证命令: {cmd}{RESET}");
+        cmd
+    } else {
+        println!("{GRAY}  ℹ️  无匹配验证工具，跳过自动化验证{RESET}");
+        return (true, String::new());
+    };
+
+    let (ok, output, _) = match executor.run(&full_cmd) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("{RED}  ✗ 验证命令失败: {e}{RESET}");
+            return (false, e.to_string());
+        }
+    };
+
+    if ok {
+        println!("{GREEN}  ✓ 验证通过{RESET}");
+        (true, String::new())
+    } else {
+        let errors: String = output.chars().take(1500).collect();
+        println!("{RED}  ✗ 验证失败{RESET}");
         for line in output.lines().take(8) {
             if line.contains("error") { println!("    {GRAY}{line}{RESET}"); }
         }
-        if attempt == CARGO_FIX_MAX {
-            println!("{RED}  ❌ 编译失败 after {CARGO_FIX_MAX} attempts{RESET}");
-        }
+        (false, errors)
     }
-    (compile_ok, last_errors)
 }
 
 // ── Main orchestrator ─────────────────────────────────────────────────────────
@@ -760,10 +790,12 @@ pub fn run_orchestrator(
     let global_tokens = Arc::new(Mutex::new(0u64));
     let global_start = Arc::new(Instant::now());
 
-    let (config, work_dir, output_lang) = {
+    let (config, work_dir, output_lang, toolchain_section, toolchain_info) = {
         let st = state.lock().unwrap();
         let lang_str = if st.lang == "zh_TW" { "Traditional Chinese (繁體中文)" } else { "English" };
-        (st.config.clone(), st.work_dir.clone(), lang_str.to_string())
+        let tc_sec = st.toolchain_prompt_section();
+        let tc_info = st.toolchain_info.clone();
+        (st.config.clone(), st.work_dir.clone(), lang_str.to_string(), tc_sec, tc_info)
     };
 
     let backend = create_backend(&config)?;
@@ -784,7 +816,7 @@ pub fn run_orchestrator(
     let opts_po = slot_opts(SlotRole::ProductOwner, &config);
 
     let prompt_a = format!(
-        "{role}请整理以下用户需求，输出自然语言摘要，包含：\n\
+        "{role}{toolchain}请整理以下用户需求，输出自然语言摘要，包含：\n\
         1. 用户期望的输出类型（代码/文档/分析/其他）\n\
         2. 用户已提供的信息\n\
         3. 可能需要补充的信息\n\n\
@@ -793,6 +825,7 @@ pub fn run_orchestrator(
         项目目录：\n{tree}\n\n\
         项目规则：\n{rules}",
         role = SlotRole::ProductOwner.role_prompt(),
+        toolchain = toolchain_section,
         request = user_request,
         tree = project_tree,
         rules = rules,
@@ -985,25 +1018,22 @@ pub fn run_orchestrator(
         println!("{CYAN}【E】模块规划...{RESET}");
 
         let prompt_e = format!(
-            "{role}{sol}## 澄清决策\n{decisions}\n\n\
-            请将解决方案拆分为可执行的模块。输出以 [MODULE_PLAN] 开头。\n\n\
-            格式（每个子模块用 [MODULE: 模块名] 标记）：\n\
-            inputs: 输入规范\n\
-            outputs: 输出规范\n\
-            constraints:\n\
-              - [HARD] 硬性约束\n\
-              - [SOFT] 软性约束\n\
-            verification:\n\
-              - 验收条件\n\
-            needs_compile: true/false\n\
-            assigned_slot: Programmer/Architect/SeniorEngineer/QA/ProductOwner\n\n\
-            规则：\n\
-            - 文档/分析/论文 → assigned_slot=Architect, needs_compile=false\n\
-            - 代码任务 → assigned_slot=Programmer（默认）或 SeniorEngineer（复杂逻辑）\n\
+            "{role}{sol}{toolchain}## 澄清决策\n{decisions}\n\n\
+            请将解决方案拆分为可执行的模块，使用以下标记语言输出每个模块：\n\n\
+            <SAKICHAN:MODULE name=\"模块名\" slot=\"Programmer|Architect|SeniorEngineer|QA|ProductOwner\" compile=\"true|false\">\n\
+              <SAKICHAN:INPUT>输入规范</SAKICHAN:INPUT>\n\
+              <SAKICHAN:OUTPUT>输出规范</SAKICHAN:OUTPUT>\n\
+              <SAKICHAN:CONSTRAINT type=\"HARD|SOFT|INFO\">约束内容</SAKICHAN:CONSTRAINT>\n\
+              <SAKICHAN:VERIFY>验收条件</SAKICHAN:VERIFY>\n\
+            </SAKICHAN:MODULE>\n\n\
+            属性说明：\n\
+            - slot=Architect: 文档/分析任务，compile=\"false\"\n\
+            - slot=Programmer（默认）或 SeniorEngineer（复杂逻辑）: 代码任务，compile=\"true\"\n\
             - 规范要足够详细，执行模型直接可用\n\
             所有输出用 {lang}。",
             role = SlotRole::Architect.role_prompt(),
             sol = solution_section(&solution_design),
+            toolchain = toolchain_section,
             decisions = decisions_str,
             lang = output_lang,
         );
@@ -1066,6 +1096,7 @@ pub fn run_orchestrator(
                     &project_tree,
                     &output_lang,
                     restart_report.as_ref(),
+                    &toolchain_section,
                 );
 
                 let f_raw = call_model(
@@ -1085,7 +1116,7 @@ pub fn run_orchestrator(
                 if blocks.is_empty() {
                     println!("{YELLOW}  ⚠ 模块 {} 未生成代码块（尝试 {attempt}）{RESET}", module.name);
                 } else {
-                    write_or_patch_files(&blocks, &work_dir, &mut written_files, &mut all_completed, any_compile);
+                    write_or_patch_files(&blocks, &work_dir, &mut written_files, &mut all_completed);
                 }
 
                 // ── Phase G: Quick Review — QA ─────────────────────────────
@@ -1161,7 +1192,7 @@ pub fn run_orchestrator(
                 )?;
                 let fix_blocks = extract_code_blocks(&fix_raw);
                 if !fix_blocks.is_empty() {
-                    write_or_patch_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed, any_compile);
+                    write_or_patch_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed);
                 }
             }
         }
@@ -1217,7 +1248,7 @@ pub fn run_orchestrator(
 
         let mut cargo_errors = String::new();
         if any_compile && !written_files.is_empty() {
-            let (mut ok, mut last_err) = run_verification(&config, &work_dir, &executor, &written_files, any_compile);
+            let (mut ok, mut last_err) = run_verification(&config, &work_dir, &executor, &written_files, any_compile, &toolchain_info);
             compile_ok = ok;
 
             // SeniorEngineer fix loop
@@ -1246,10 +1277,10 @@ pub fn run_orchestrator(
 
                     let fix_blocks = extract_code_blocks(&fix_raw);
                     if !fix_blocks.is_empty() {
-                        write_or_patch_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed, true);
+                        write_or_patch_files(&fix_blocks, &work_dir, &mut written_files, &mut all_completed);
                     }
 
-                    let (ok2, err2) = run_verification(&config, &work_dir, &executor, &written_files, any_compile);
+                    let (ok2, err2) = run_verification(&config, &work_dir, &executor, &written_files, any_compile, &toolchain_info);
                     ok = ok2; last_err = err2;
                     if ok { compile_ok = true; break; }
                     if fix_attempt == CARGO_FIX_MAX {
@@ -1347,7 +1378,7 @@ pub fn run_orchestrator(
 
             let rework_blocks = extract_code_blocks(&rework_raw);
             if !rework_blocks.is_empty() {
-                write_or_patch_files(&rework_blocks, &work_dir, &mut written_files, &mut all_completed, any_compile);
+                write_or_patch_files(&rework_blocks, &work_dir, &mut written_files, &mut all_completed);
             }
         }
 

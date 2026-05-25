@@ -12,12 +12,12 @@ mod state;
 
 use backend::ollama::OllamaBackend;
 use commands::{get_i18n, handle_command, t};
-use config::load_config;
+use config::{load_config, ToolchainEntry};
 use display::*;
 use orchestrator::run_orchestrator;
 use rules::RulesManager;
 use slots::{build_slot_assignments, probe_ollama_models};
-use state::AppState;
+use state::{AppState, DetectedTool};
 
 use anyhow::Result;
 use rustyline::completion::{Completer, Pair};
@@ -81,6 +81,67 @@ impl Validator for CmdHelper {
     }
 }
 
+const TOOLCHAIN_REGISTRY: &[(&str, &str, &str, &str)] = &[
+    // (display_name, executable, version_flag, description)
+    ("cargo",  "cargo",   "--version", "Rust 包管理器和编译器"),
+    ("python3","python3", "--version", "Python 3 解释器"),
+    ("python", "python",  "--version", "Python 解释器"),
+    ("node",   "node",    "--version", "Node.js 运行时"),
+    ("npm",    "npm",     "--version", "npm 包管理器"),
+    ("npx",    "npx",     "--version", "npx 命令执行器"),
+    ("tsc",    "tsc",     "--version", "TypeScript 编译器"),
+    ("go",     "go",      "version",   "Go 编译器"),
+    ("zig",    "zig",     "version",   "Zig 编译器"),
+    ("java",   "java",    "--version", "Java 运行时"),
+    ("gcc",    "gcc",     "--version", "GCC C/C++ 编译器"),
+    ("clang",  "clang",   "--version", "Clang 编译器"),
+    ("make",   "make",    "--version", "GNU Make"),
+    ("cmake",  "cmake",   "--version", "CMake 构建系统"),
+    ("git",    "git",     "--version", "版本控制系统"),
+    ("docker", "docker",  "--version", "容器运行时"),
+];
+
+fn detect_toolchain(user_entries: &[ToolchainEntry]) -> Vec<DetectedTool> {
+    let mut detected: Vec<DetectedTool> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for &(name, cmd, flag, description) in TOOLCHAIN_REGISTRY {
+        let output = std::process::Command::new(cmd)
+            .arg(flag)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let raw_ver = if stdout.trim().is_empty() { stderr.trim().to_string() } else { stdout.trim().to_string() };
+            let version = raw_ver.lines().next().unwrap_or("").trim().to_string();
+            detected.push(DetectedTool { name: name.to_string(), version, description: description.to_string() });
+            seen.insert(name.to_string());
+        }
+    }
+
+    for entry in user_entries {
+        if seen.contains(&entry.name) { continue; }
+        let parts: Vec<&str> = entry.check_command.split_whitespace().collect();
+        let Some(&cmd) = parts.first() else { continue };
+        let out = std::process::Command::new(cmd)
+            .args(&parts[1..])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() {
+                let version = String::from_utf8_lossy(&o.stdout)
+                    .lines().next().unwrap_or("").trim().to_string();
+                detected.push(DetectedTool { name: entry.name.clone(), version, description: entry.description.clone() });
+            }
+        }
+    }
+
+    detected
+}
+
 fn main() -> Result<()> {
     let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -116,21 +177,28 @@ fn main() -> Result<()> {
     // 3. Build slot assignments
     let slot_assignments = build_slot_assignments(&cfg, &available_models);
 
-    // 4. Initialize state
+    // 4. Detect toolchain
+    print!("{CYAN}检测工具链 / Detecting toolchain...{RESET} ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let toolchain = detect_toolchain(&cfg.toolchain);
+    println!("{GREEN}找到 {} 个工具{RESET}", toolchain.len());
+
+    // 5. Initialize state
     let mut initial_state = AppState::new(work_dir.clone(), cfg);
     initial_state.slot_assignments = slot_assignments;
+    initial_state.toolchain_info = toolchain;
     let state = Arc::new(Mutex::new(initial_state));
 
-    // 5. Init .sakichan.md
+    // 6. Init .sakichan.md
     let rules_mgr = RulesManager::new(work_dir.join(".sakichan.md"));
     let _ = rules_mgr.init();
 
-    // 6. Print welcome
+    // 7. Print welcome
     let mut sorted_models = models.clone();
     sorted_models.sort();
     print_welcome("0.4.0", &sorted_models);
 
-    // 7. Git status
+    // 8. Git status
     let git_ok = std::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(&work_dir)
@@ -160,7 +228,7 @@ fn main() -> Result<()> {
     }
     println!();
 
-    // 8. REPL
+    // 9. REPL
     let i18n = get_i18n();
     let mut context: Vec<String> = Vec::new();
 

@@ -177,10 +177,11 @@ impl SpinnerState {
     }
 }
 
-// Fix 7: Spinner now takes shared global token counter and start time.
-// Timer and token count never reset between phases.
+// Spinner: globally unique line, always overwrites in-place via \r.
+// set_hint() updates auxiliary text (e.g. active model name) without printing new lines.
 pub struct Spinner {
     stop: Arc<Mutex<bool>>,
+    pub hint: Arc<Mutex<String>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -191,7 +192,9 @@ impl Spinner {
         global_start: Arc<Instant>,
     ) -> Self {
         let stop = Arc::new(Mutex::new(false));
+        let hint = Arc::new(Mutex::new(String::new()));
         let stop_clone = Arc::clone(&stop);
+        let hint_clone = Arc::clone(&hint);
         let label = state.label().to_string();
         let color = state.color().to_string();
 
@@ -201,9 +204,15 @@ impl Spinner {
                 if *stop_clone.lock().unwrap() { break; }
                 let elapsed = global_start.elapsed().as_secs();
                 let tokens = *global_tokens.lock().unwrap();
+                let hint_str = hint_clone.lock().unwrap().clone();
                 let frame = SPINNER_FRAMES[i % SPINNER_FRAMES.len()];
+                let suffix = if hint_str.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {GRAY}[{hint_str}]{RESET}")
+                };
                 print!(
-                    "\r  {color}🟠 {frame} {label}{RESET} {GRAY}({} · {} tokens){RESET}   ",
+                    "\r  {color}🟠 {frame} {label}{RESET} {GRAY}({} · {} tokens){suffix}{RESET}   ",
                     fmt_elapsed(elapsed),
                     format_num(tokens),
                 );
@@ -211,11 +220,15 @@ impl Spinner {
                 i += 1;
                 thread::sleep(Duration::from_millis(80));
             }
-            print!("\r{}\r", " ".repeat(80));
+            print!("\r{}\r", " ".repeat(100));
             let _ = std::io::Write::flush(&mut std::io::stdout());
         });
 
-        Spinner { stop, handle: Some(handle) }
+        Spinner { stop, hint, handle: Some(handle) }
+    }
+
+    pub fn set_hint(&self, h: &str) {
+        *self.hint.lock().unwrap() = h.to_string();
     }
 
     pub fn stop(mut self) {
