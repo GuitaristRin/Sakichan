@@ -1,6 +1,7 @@
 use crate::config::{ModelPreset, SakichanConfig};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+pub mod llama_server;
 
 pub mod ollama;
 
@@ -80,8 +81,17 @@ pub trait LlmBackend: Send + Sync {
 pub fn create_backend(config: &SakichanConfig) -> Result<Box<dyn LlmBackend>> {
     match config.backend.backend_type.as_str() {
         "ollama" => Ok(Box::new(ollama::OllamaBackend::new(&config.backend.ollama)?)),
+        "llama_server" => Ok(Box::new(llama_server::LlamaServerBackend::new(
+            &config.backend.llama_server.executable,
+            &config.backend.llama_server.host,
+            config.backend.llama_server.port,
+            &config.backend.llama_server.model_dir,
+            config.backend.llama_server.n_gpu_layers,
+            config.backend.llama_server.n_ctx,
+            config.backend.llama_server.n_batch,
+        )?)),
         "lmcpp" => Err(anyhow::anyhow!(
-            "llama.cpp 后端尚未实现。请在 sakichan.conf 中设置 [backend] type = \"ollama\"。"
+            "llama.cpp 后端尚未实现。请在 sakichan.conf 中设置 backend.type = \"llama_server\" 或 \"ollama\"。"
         )),
         other => Err(anyhow::anyhow!("不支持的后端类型: {}", other)),
     }

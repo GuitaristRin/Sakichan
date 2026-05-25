@@ -35,13 +35,20 @@ pub struct BackendConfig {
     pub ollama: OllamaConfig,
     #[serde(default)]
     pub lmcpp: LmCppConfig,
+    #[serde(default)]
+    pub llama_server: LlamaServerConfig,
 }
 
 fn default_backend_type() -> String { "ollama".to_string() }
 
 impl Default for BackendConfig {
     fn default() -> Self {
-        Self { backend_type: default_backend_type(), ollama: Default::default(), lmcpp: Default::default() }
+        Self {
+            backend_type: default_backend_type(),
+            ollama: Default::default(),
+            lmcpp: Default::default(),
+            llama_server: Default::default(),
+        }
     }
 }
 
@@ -67,6 +74,44 @@ pub struct LmCppConfig {
     pub n_ctx: u32,
     #[serde(default = "default_n_batch")]
     pub n_batch: u32,
+}
+
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LlamaServerConfig {
+    #[serde(default = "default_llama_server_executable")]
+    pub executable: String,
+    #[serde(default = "default_llama_server_host")]
+    pub host: String,
+    #[serde(default = "default_llama_server_port")]
+    pub port: u16,
+    #[serde(default = "default_llama_server_model_dir")]
+    pub model_dir: String,
+    #[serde(default = "default_n_gpu_layers")]
+    pub n_gpu_layers: i32,
+    #[serde(default = "default_n_ctx")]
+    pub n_ctx: u32,
+    #[serde(default = "default_n_batch")]
+    pub n_batch: u32,
+}
+
+fn default_llama_server_executable() -> String { "llama-cpp/llama-server.exe".to_string() }
+fn default_llama_server_host() -> String { "127.0.0.1".to_string() }
+fn default_llama_server_port() -> u16 { 8081 }
+fn default_llama_server_model_dir() -> String { "llama-cpp".to_string() }
+
+impl Default for LlamaServerConfig {
+    fn default() -> Self {
+        Self {
+            executable: default_llama_server_executable(),
+            host: default_llama_server_host(),
+            port: default_llama_server_port(),
+            model_dir: default_llama_server_model_dir(),
+            n_gpu_layers: default_n_gpu_layers(),
+            n_ctx: default_n_ctx(),
+            n_batch: default_n_batch(),
+        }
+    }
 }
 
 fn default_model_dirs() -> Vec<String> { vec![".".to_string(), "~/.cache/sakichan/models".to_string()] }
