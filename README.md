@@ -7,6 +7,7 @@ Sakichan 是一个高性能 AI 客户端，支持多模型接入、长短期记�
 - **多模型支持** — SenseNova Flash-Lite（默认多模态）、DeepSeek V4 Flash（思考模式）
 - **多模态图像理解** — 直接 SenseNova 图片问答，或 `--dsv4f TRUE` 启用两阶段分析
 - **对话分支** — 通过 `--deri` 和 `--order` 在任意对话层级创建平行分支
+- **对话压缩** — `--compressconv` 对当前分支全部消息生成总结，可增量叠加，持久化存储
 - **长期记忆** — CJK 感知的关键词检索，自动注入相关记忆到对话上下文
 - **文本文件附件** — `--file` 读取文本文件作为上下文
 - **256K 上下文窗口** — 滑动窗口截断，保留关键历史
@@ -49,6 +50,9 @@ sakichan --session <ID> --prompt "总结这个文件" --file notes.txt
 
 # 启用 DeepSeek 思考模式
 sakichan --session <ID> --prompt "..." --dsv4f TRUE --thinking TRUE
+
+# 总结当前分支对话并保存
+sakichan --session <ID> --compressconv
 ```
 
 ## CLI Reference
@@ -65,6 +69,7 @@ sakichan --session <ID> --prompt "..." --dsv4f TRUE --thinking TRUE
 | `--order <n>` | 分支 order 编号 |
 | `--delete` | 删除会话 |
 | `--summary` | 生成/更新会话标题 |
+| `--compressconv` | 总结并存储当前分支全部对话 |
 | `--token <key>` | 设置 API Key，或 `clear` 清除 |
 
 ## Model Selection
@@ -140,6 +145,18 @@ CLI args → resolve session → apply branching → select model
      → persist assistant response
   → print usage stats
 ```
+
+## Conversation Compression
+
+`--compressconv` 对当前分支（以 `active_depth` / `active_order` 为准）的全部消息调用模型生成总结，并将结果持久化到 SQLite 的 `conversation_summaries` 表中。
+
+```bash
+sakichan --session <ID> --compressconv
+```
+
+- **增量叠加** — 若已有历史总结，生成时自动将上一条总结作为参考上下文，确保新总结准确延续
+- **存储字段** — `content`（总结内容）、`depth`、`order_at`（分支坐标）、`messages_count`（消息数量）、`summarized_at`（生成时间 UTC Unix 时间戳）
+- **级联删除** — 会话删除时所有对应总结自动清除
 
 ## Branching
 

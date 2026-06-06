@@ -35,12 +35,15 @@ sakichan-cli --session <ID> --prompt "..." --deri 1 --order 2
 # Session title
 sakichan-cli --session <ID> --summary
 
+# Compress/summarize conversation
+sakichan-cli --session <ID> --compressconv
+
 # API key management
 sakichan-cli --token sk-xxx                       # Set API key
 sakichan-cli --token clear                        # Clear API keys
 ```
 
-Key flags: `--session` (required for chat), `--prompt`, `--image` (repeatable), `--file` (repeatable, text files), `--dsv4f TRUE/FALSE`, `--thinking TRUE/FALSE`, `--delete`, `--summary`, `--token`, `--deri`, `--order`.
+Key flags: `--session` (required for chat), `--prompt`, `--image` (repeatable), `--file` (repeatable, text files), `--dsv4f TRUE/FALSE`, `--thinking TRUE/FALSE`, `--delete`, `--summary`, `--compressconv`, `--token`, `--deri`, `--order`.
 
 ## Model Strategy
 
@@ -67,7 +70,7 @@ All business logic, no CLI dependency. Key modules:
 - **`models/sensenova_flash_lite.rs`** — OpenAI-compatible chat model. Multimodal (text + image_url content blocks). No reasoning_content support.
 - **`models/deepseek_v4_flash.rs`** — OpenAI-compatible with reasoning support. Emits `reasoning_content` in SSE delta. Extra params merged at request body top level (e.g. `reasoning_effort`).
 - **`models/sensenova_u1_fast.rs`** — Image generation via `/images/generations` endpoint. Independent of chat models.
-- **`session/store.rs`** — SQLite persistence (`sessions` + `messages` tables). Messages track `depth` + `message_order` for branching. Schema migration via `PRAGMA table_info` → `ALTER TABLE ADD COLUMN`.
+- **`session/store.rs`** — SQLite persistence (`sessions` + `messages` + `conversation_summaries` tables). Messages track `depth` + `message_order` for branching. Summaries store compressed conversation history per branch. Schema migration via `PRAGMA table_info` → `ALTER TABLE ADD COLUMN`.
 - **`session/context.rs`** — In-memory `VecDeque<Message>` with sliding-window truncation (256K token budget, 4K output reserve). Branch tracking (`current_depth/current_order`). Memory injection and context injection support.
 - **`memory/store.rs`** — SQLite-backed long-term memory (`long_term_memories` table).
 - **`memory/retrieval.rs`** — CJK-aware keyword extraction → LIKE search. Falls back to most recent memories.
@@ -78,7 +81,7 @@ All business logic, no CLI dependency. Key modules:
 
 CLI frontend (tokio + clap + colored + keyring). Only 3 source files:
 
-- **`main.rs`** — Entry point, all handlers (`handle_send_prompt`, `handle_session_create/list/delete/suspend/summary`), model selection logic, image pipeline (two-stage for --dsv4f TRUE, direct for FALSE), file reading, branching logic.
+- **`main.rs`** — Entry point, all handlers (`handle_send_prompt`, `handle_session_create/list/delete/suspend/summary`, `handle_compress_conv`), model selection logic, image pipeline (two-stage for --dsv4f TRUE, direct for FALSE), file reading, branching logic.
 - **`render.rs`** — Terminal output: `StreamingLine` (green during streaming, overwrite via `\r`), `print_info`, `print_model`, `print_usage`, `print_session_entry`.
 - **`keyring.rs`** — OS keychain wrapper via `keyring` crate. `set_api_key`, `get_api_key`, `delete_api_key`, `clear_all_api_keys`, `set_all_api_keys`.
 
@@ -105,6 +108,7 @@ User CLI args → main() → handle_send_prompt()
 
 - **Streaming output**: `StreamingLine` prints tokens inline in green as they arrive, using `\r` to overwrite the current line. No per-token prefix repetition.
 - **Branching**: Messages stored with `(depth, order)` coordinates. `get_branch_messages()` filters the active path for model context. `--deri` creates parallel branches at a given depth.
+- **Conversation compression**: `--compressconv` reads the active branch messages, optionally prepends the latest existing summary as reference context, calls the model, and persists the result to `conversation_summaries`. Fields: `depth`, `order_at`, `content`, `messages_count`, `summarized_at`.
 - **Keychain**: API keys stored in OS keychain, referenced in config as `ENC_KEYRING:com.sakichan/<name>`. Resolved at startup; `--token` for management.
 - **Schema migration**: `initialize_tables()` uses `CREATE TABLE IF NOT EXISTS` followed by `PRAGMA table_info` → `ALTER TABLE ADD COLUMN` for backward-compatible migrations.
 

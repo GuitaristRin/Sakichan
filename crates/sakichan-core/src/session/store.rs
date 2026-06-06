@@ -8,6 +8,18 @@ use uuid::Uuid;
 use crate::error::{Result, SakichanError};
 use crate::models::Message;
 
+/// A stored conversation summary.
+#[derive(Clone, Debug)]
+pub struct ConversationSummary {
+    pub id: i64,
+    pub session_id: String,
+    pub depth: i64,
+    pub order_at: i64,
+    pub content: String,
+    pub messages_count: usize,
+    pub summarized_at: i64,
+}
+
 /// A session record.
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -92,10 +104,24 @@ impl SessionStore {
         Self::migrate_add_column_inner(&conn, "messages", "depth", "INTEGER NOT NULL DEFAULT 0")?;
         Self::migrate_add_column_inner(&conn, "messages", "message_order", "INTEGER NOT NULL DEFAULT 0")?;
 
-        // Phase 3: new indexes
+        // Phase 3: new indexes + conversation_summaries table
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_session_depth
-                ON messages(session_id, depth, message_order);"
+                ON messages(session_id, depth, message_order);
+
+            CREATE TABLE IF NOT EXISTS conversation_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                depth INTEGER NOT NULL DEFAULT 0,
+                order_at INTEGER NOT NULL DEFAULT 0,
+                content TEXT NOT NULL,
+                messages_count INTEGER NOT NULL DEFAULT 0,
+                summarized_at INTEGER NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_summaries_session
+                ON conversation_summaries(session_id, summarized_at);"
         )?;
 
         Ok(())
@@ -377,6 +403,78 @@ impl SessionStore {
             .ok()
             .flatten();
         Ok(max_depth.unwrap_or(0))
+    }
+
+    /// Save a conversation summary for a session branch.
+    pub fn save_summary(
+        &self,
+        session_id: &str,
+        depth: i64,
+        order_at: i64,
+        content: &str,
+        messages_count: usize,
+    ) -> Result<i64> {
+        let now = Utc::now().timestamp();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries (session_id, depth, order_at, content, messages_count, summarized_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![session_id, depth, order_at, content, messages_count as i64, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get all conversation summaries for a session, ordered by time ascending.
+    pub fn get_summaries(&self, session_id: &str) -> Result<Vec<ConversationSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, depth, order_at, content, messages_count, summarized_at
+             FROM conversation_summaries WHERE session_id = ?1
+             ORDER BY summarized_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(ConversationSummary {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                depth: row.get(2)?,
+                order_at: row.get(3)?,
+                content: row.get(4)?,
+                messages_count: row.get::<_, i64>(5)? as usize,
+                summarized_at: row.get(6)?,
+            })
+        })?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
+    /// Get the most recent conversation summary for a session.
+    pub fn get_latest_summary(&self, session_id: &str) -> Result<Option<ConversationSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, session_id, depth, order_at, content, messages_count, summarized_at
+             FROM conversation_summaries WHERE session_id = ?1
+             ORDER BY summarized_at DESC LIMIT 1",
+            params![session_id],
+            |row| {
+                Ok(ConversationSummary {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    depth: row.get(2)?,
+                    order_at: row.get(3)?,
+                    content: row.get(4)?,
+                    messages_count: row.get::<_, i64>(5)? as usize,
+                    summarized_at: row.get(6)?,
+                })
+            },
+        );
+        match result {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Get messages filtered to a specific branch chain.

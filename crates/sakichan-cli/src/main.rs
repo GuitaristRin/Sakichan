@@ -60,6 +60,10 @@ struct Cli {
     /// Text file paths to attach as context (can be specified multiple times)
     #[arg(long)]
     file: Vec<String>,
+
+    /// Summarize and store the conversation for the current branch
+    #[arg(long)]
+    compressconv: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +502,124 @@ async fn handle_send_prompt(
 }
 
 // ---------------------------------------------------------------------------
+// Conversation compression handler
+// ---------------------------------------------------------------------------
+
+async fn handle_compress_conv(app: &AppContext, session_id: &str) -> Result<()> {
+    let session = app
+        .session_store
+        .get_session(session_id)?
+        .with_context(|| format!("会话不存在: {session_id}"))?;
+
+    let active_depth = session.active_depth;
+    let active_order = session.active_order;
+
+    let messages = app
+        .session_store
+        .get_branch_messages(session_id, active_depth, active_order)?;
+
+    if messages.is_empty() {
+        render::print_info("当前分支没有消息可总结。");
+        return Ok(());
+    }
+
+    // Check for existing summaries to use as reference
+    let existing_summaries = app.session_store.get_summaries(session_id)?;
+
+    // Build conversation transcript
+    let conversation_text = messages
+        .iter()
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "user" => "用户",
+                "assistant" => "助手",
+                "system" => "系统",
+                _ => &m.role,
+            };
+            format!("[{}]: {}", role, m.content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // Build prompt, optionally referencing previous summary
+    let mut prompt = String::new();
+    if let Some(prev) = existing_summaries.last() {
+        let prev_time = chrono::DateTime::from_timestamp(prev.summarized_at, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_default();
+        prompt.push_str(&format!(
+            "以下是本会话之前的总结（生成于 {}）：\n{}\n\n---\n\n",
+            prev_time, prev.content
+        ));
+    }
+    prompt.push_str(&format!(
+        "请对以下完整对话内容进行精准简洁的总结，涵盖关键信息、主要结论和重要细节。\
+        总结应当结构清晰，便于快速理解对话的核心内容：\n\n{}",
+        conversation_text
+    ));
+
+    let model_id = select_text_model(&app.config, false);
+    let model = create_chat_model(&app.config, model_id)?;
+
+    render::print_info(&format!(
+        "正在总结 depth={} order={} 分支的 {} 条消息...",
+        active_depth,
+        active_order,
+        messages.len()
+    ));
+
+    let mut summary_content = String::new();
+    let mut result_line = render::StreamingLine::new("[SUMMARY]");
+
+    model
+        .chat_stream(
+            &[
+                sakichan_core::models::Message::system(
+                    "你是一个专业的对话总结助手。请生成精准、简洁的对话总结，包含关键信息和主要结论。",
+                ),
+                sakichan_core::models::Message::user(&prompt),
+            ],
+            &sakichan_core::models::ChatOptions {
+                temperature: Some(0.3),
+                ..Default::default()
+            },
+            &mut |event| {
+                if let sakichan_core::models::StreamEvent::Token(t) = event {
+                    summary_content.push_str(&t);
+                    result_line.stream(&t);
+                }
+            },
+        )
+        .await?;
+
+    result_line.finish();
+
+    if summary_content.trim().is_empty() {
+        render::print_info("总结生成失败，未获得有效内容。");
+        return Ok(());
+    }
+
+    app.session_store.save_summary(
+        session_id,
+        active_depth,
+        active_order,
+        summary_content.trim(),
+        messages.len(),
+    )?;
+
+    let now = chrono::Utc::now();
+    render::print_info(&format!(
+        "总结已保存 | depth={} order={} | {} 条消息 | {}",
+        active_depth,
+        active_order,
+        messages.len(),
+        now.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Session list and summary handlers
 // ---------------------------------------------------------------------------
 
@@ -607,6 +729,8 @@ async fn main() -> Result<()> {
                 handle_session_delete(&app, session_id)?;
             } else if cli.summary {
                 handle_session_summary(&app, session_id).await?;
+            } else if cli.compressconv {
+                handle_compress_conv(&app, session_id).await?;
             } else if let Some(prompt) = &cli.prompt {
                 let thinking = cli.thinking.to_uppercase() == "TRUE";
                 let dsv4f = cli.dsv4f.to_uppercase() == "TRUE";
