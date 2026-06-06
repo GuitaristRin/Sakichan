@@ -378,6 +378,116 @@ popover.context-menu-pop > contents {
 .ctx-item-danger { color: #bb5555; }
 .ctx-item-danger:hover { color: #ee6666; background-color: rgba(180,40,40,.12); }
 
+/* ── Loading animation ───────────────────────────────── */
+
+.loading-box {
+    padding: 8px 14px;
+    margin-right: 18%;
+}
+
+spinner.loading-spinner {
+    color: #2e7a4e;
+    min-width: 16px;
+    min-height: 16px;
+}
+
+.loading-label {
+    font-size: 13px;
+    color: #2e7a4e;
+    font-style: italic;
+    margin-left: 8px;
+}
+
+/* ── Thinking section ────────────────────────────────── */
+
+.think-toggle-btn {
+    background: none;
+    border: none;
+    color: #2e6040;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 4px 0;
+    margin-bottom: 4px;
+    text-align: left;
+    transition: color 100ms linear;
+}
+.think-toggle-btn:hover  { color: #3a8a5a; background: none; }
+.think-toggle-btn:active { background: none; }
+
+.thinking-content {
+    background-color: #0f1f16;
+    border-left: 2px solid #1a4028;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+}
+
+/* ── Branch navigation ───────────────────────────────── */
+
+.branch-nav {
+    padding: 4px 0 6px;
+    margin: 0 0 2px;
+}
+
+.branch-nav-btn {
+    background: none;
+    border: 1px solid #253d2c;
+    color: #3a7a55;
+    font-size: 13px;
+    font-weight: 500;
+    min-width: 28px;
+    min-height: 24px;
+    padding: 2px 6px;
+    transition: all 80ms linear;
+}
+.branch-nav-btn:hover   { background-color: #162513; color: #5aaa7a; border-color: #3a5a3e; }
+.branch-nav-btn:active  { background-color: #0f1e12; }
+.branch-nav-btn:disabled { color: #253d2c; border-color: #1a2e1e; }
+
+.branch-nav-label {
+    font-size: 11px;
+    color: #3a6a50;
+    margin: 0 6px;
+    letter-spacing: 0.5px;
+}
+
+/* ── Edit mode ───────────────────────────────────────── */
+
+textview.edit-input,
+textview.edit-input > text {
+    background-color: #0f1a14;
+    color: #ddd;
+    font-size: 14px;
+    caret-color: #3d8a5a;
+    border: 1px solid #2e5a3e;
+    padding: 6px 10px;
+}
+
+.edit-confirm-btn {
+    background-color: #1c5035;
+    border: none;
+    color: #c8ecd8;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 14px;
+    min-height: 26px;
+    transition: background-color 100ms linear;
+}
+.edit-confirm-btn:hover  { background-color: #225e3f; }
+.edit-confirm-btn:active { background-color: #193d2b; }
+
+.edit-cancel-btn {
+    background-color: #161616;
+    border: 1px solid #2a2a2a;
+    color: #666;
+    font-size: 12px;
+    padding: 4px 14px;
+    min-height: 26px;
+    transition: all 100ms linear;
+}
+.edit-cancel-btn:hover  { background-color: #1e1e1e; color: #888; border-color: #363636; }
+.edit-cancel-btn:active { background-color: #111; }
+
 /* ── Dim overlay ─────────────────────────────────────── */
 
 .dim-overlay { background-color: rgba(0,0,0,.52); }

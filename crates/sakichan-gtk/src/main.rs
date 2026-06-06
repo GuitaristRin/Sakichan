@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use gtk4::prelude::*;
@@ -10,8 +10,8 @@ use gtk4::{
     Align, Application, ApplicationWindow, Box as GBox, Button, CssProvider,
     Entry, EventControllerKey, FileDialog, FileFilter, GestureClick, Label,
     ListBox, ListBoxRow, Orientation, Overlay, PolicyType, Popover,
-    Revealer, RevealerTransitionType, ScrolledWindow, TextBuffer, TextView,
-    ToggleButton, WrapMode, STYLE_PROVIDER_PRIORITY_APPLICATION,
+    Revealer, RevealerTransitionType, ScrolledWindow, Spinner, TextBuffer,
+    TextView, ToggleButton, WrapMode, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 
 use sakichan_core::config::{self, Config};
@@ -37,7 +37,7 @@ fn rt() -> &'static tokio::runtime::Runtime {
 }
 
 // ─────────────────────────────────────────
-// Application state  (GTK main thread only)
+// Application state
 // ─────────────────────────────────────────
 
 struct AppState {
@@ -45,19 +45,22 @@ struct AppState {
     memory_store:  Arc<MemoryStore>,
     config:        Arc<Config>,
     current_sid:   Option<String>,
-    pending_imgs:  Vec<(String, String)>, // (filename, data_uri)
+    pending_imgs:  Vec<(String, String)>,
     pending_files: Vec<String>,
     is_generating: bool,
 }
 
 type State = Rc<RefCell<AppState>>;
 
-// Shared UI references threaded through refresh/do_send
+// Shared UI references passed through helpers
 #[derive(Clone)]
 struct PanelCtx {
-    chat_box:    GBox,
-    chat_scroll: ScrolledWindow,
-    sess_title:  Label,
+    chat_box:     GBox,
+    chat_scroll:  ScrolledWindow,
+    sess_title:   Label,
+    session_list: ListBox,
+    send_btn:     Button,
+    dsv4f_btn:    ToggleButton,
 }
 
 impl AppState {
@@ -176,7 +179,6 @@ fn make_model(cfg: &Config, model_id: &str) -> anyhow::Result<Box<dyn ChatModel>
     })
 }
 
-// Call a model with a single-turn prompt, return the full text response.
 async fn call_model_text(
     cfg: Arc<Config>,
     model_id: &str,
@@ -235,11 +237,10 @@ fn escape_pango(s: &str) -> String {
 }
 
 fn flush_pango_label(container: &GBox, markup: &str) {
-    let text = markup.trim_end_matches('\n').trim_start_matches('\n');
+    let text = markup.trim_matches('\n').trim();
     if text.is_empty() { return; }
     let lbl = Label::new(None);
     lbl.add_css_class("message-text");
-    // Use set_markup; fall back to plain text on Pango parse error
     lbl.set_markup(text);
     lbl.set_wrap(true);
     lbl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
@@ -254,17 +255,17 @@ fn make_code_block(code: &str, lang: &str) -> GBox {
     let outer = GBox::new(Orientation::Vertical, 0);
     outer.add_css_class("code-block");
 
-    // Header row with optional language label + copy button
     let hdr = GBox::new(Orientation::Horizontal, 0);
     hdr.add_css_class("code-block-header");
     if !lang.is_empty() {
-        let lang_lbl = Label::new(Some(lang));
-        lang_lbl.add_css_class("code-lang");
-        hdr.append(&lang_lbl);
+        let ll = Label::new(Some(lang));
+        ll.add_css_class("code-lang");
+        hdr.append(&ll);
     }
     let spacer = GBox::new(Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     hdr.append(&spacer);
+
     let copy_btn = Button::with_label("复制");
     copy_btn.add_css_class("code-copy-btn");
     let code_owned = code.trim_end_matches('\n').to_string();
@@ -272,16 +273,15 @@ fn make_code_block(code: &str, lang: &str) -> GBox {
         if let Some(display) = gdk4::Display::default() {
             display.clipboard().set_text(&code_owned);
             btn.set_label("已复制 ✓");
-            let btn2 = btn.clone();
+            let b2 = btn.clone();
             glib::timeout_add_local_once(Duration::from_millis(1500), move || {
-                btn2.set_label("复制");
+                b2.set_label("复制");
             });
         }
     });
     hdr.append(&copy_btn);
     outer.append(&hdr);
 
-    // Code content in a scrollable, non-editable TextView
     let buf = TextBuffer::new(None);
     buf.set_text(code.trim_end_matches('\n'));
     let view = TextView::with_buffer(&buf);
@@ -313,17 +313,16 @@ fn build_markdown_widget(content: &str) -> GBox {
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(content, opts);
 
-    let mut pango  = String::new(); // current pango-markup accumulator
-    let mut code   = String::new(); // code block accumulator
-    let mut lang   = String::new();
-    let mut in_code = false;
-    let mut list_ordered = false;
-    let mut list_counter = 0u64;
-    let mut in_item = false;
+    let mut pango       = String::new();
+    let mut code_buf    = String::new();
+    let mut lang        = String::new();
+    let mut in_code     = false;
+    let mut list_ord    = false;
+    let mut list_count  = 0u64;
+    let mut in_item     = false;
 
     for event in parser {
         match event {
-            // ── Code blocks ──────────────────────────────
             Event::Start(Tag::CodeBlock(kind)) => {
                 flush_pango_label(&container, &pango);
                 pango.clear();
@@ -334,13 +333,11 @@ fn build_markdown_widget(content: &str) -> GBox {
                 };
             }
             Event::End(TagEnd::CodeBlock) => {
-                container.append(&make_code_block(&code, &lang));
-                code.clear();
+                container.append(&make_code_block(&code_buf, &lang));
+                code_buf.clear();
                 lang.clear();
                 in_code = false;
             }
-
-            // ── Headings ─────────────────────────────────
             Event::Start(Tag::Heading { level, .. }) => {
                 flush_pango_label(&container, &pango);
                 pango.clear();
@@ -356,30 +353,25 @@ fn build_markdown_widget(content: &str) -> GBox {
                 flush_pango_label(&container, &pango);
                 pango.clear();
             }
-
-            // ── Paragraphs ───────────────────────────────
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => {
                 flush_pango_label(&container, &pango);
                 pango.clear();
             }
-
-            // ── Lists ────────────────────────────────────
             Event::Start(Tag::List(start)) => {
-                list_ordered = start.is_some();
-                list_counter = start.unwrap_or(1);
+                list_ord   = start.is_some();
+                list_count = start.unwrap_or(1);
             }
             Event::End(TagEnd::List(_)) => {
                 flush_pango_label(&container, &pango);
                 pango.clear();
-                list_ordered = false;
             }
             Event::Start(Tag::Item) => {
                 flush_pango_label(&container, &pango);
                 pango.clear();
-                if list_ordered {
-                    pango.push_str(&format!("{}. ", list_counter));
-                    list_counter += 1;
+                if list_ord {
+                    pango.push_str(&format!("{}. ", list_count));
+                    list_count += 1;
                 } else {
                     pango.push_str("• ");
                 }
@@ -390,105 +382,120 @@ fn build_markdown_widget(content: &str) -> GBox {
                 pango.clear();
                 in_item = false;
             }
-
-            // ── Inline formatting ────────────────────────
             Event::Start(Tag::Strong) => pango.push_str("<b>"),
             Event::End(TagEnd::Strong) => pango.push_str("</b>"),
             Event::Start(Tag::Emphasis) => pango.push_str("<i>"),
             Event::End(TagEnd::Emphasis) => pango.push_str("</i>"),
             Event::Start(Tag::Strikethrough) => pango.push_str("<s>"),
             Event::End(TagEnd::Strikethrough) => pango.push_str("</s>"),
-            Event::Start(Tag::Link { dest_url, title, .. }) => {
-                // Just show text; ignore href
-                let _ = (dest_url, title);
-            }
-            Event::End(TagEnd::Link) => {}
-
-            // ── Inline code ──────────────────────────────
+            Event::Start(Tag::Link { .. }) | Event::End(TagEnd::Link) => {}
             Event::Code(t) => {
                 pango.push_str("<tt>");
                 pango.push_str(&escape_pango(&t));
                 pango.push_str("</tt>");
             }
-
-            // ── Text ─────────────────────────────────────
             Event::Text(t) => {
                 if in_code {
-                    code.push_str(&t);
+                    code_buf.push_str(&t);
                 } else {
                     pango.push_str(&escape_pango(&t));
                 }
             }
-
-            // ── Breaks ───────────────────────────────────
             Event::SoftBreak => {
                 if !in_item { pango.push('\n'); }
             }
             Event::HardBreak => pango.push('\n'),
-
-            // ── Rule ─────────────────────────────────────
             Event::Rule => {
                 flush_pango_label(&container, &pango);
                 pango.clear();
             }
-
             _ => {}
         }
     }
-
     flush_pango_label(&container, &pango);
     container
 }
 
-// Build a complete (non-streaming) message widget using markdown.
-fn make_message_widget(role: &str, content: &str, thinking: Option<&str>) -> GBox {
-    let outer = GBox::new(Orientation::Vertical, 4);
-    outer.add_css_class(if role == "user" {
-        "msg-wrapper-user"
-    } else {
-        "msg-wrapper-assistant"
-    });
+// ─────────────────────────────────────────
+// Message widgets
+// ─────────────────────────────────────────
 
+// Static (non-interactive) widget for a single message.  Used as fallback.
+fn msg_role_header(role: &str) -> Label {
     let role_str = match role {
         "user"      => "用户",
         "assistant" => "Sakichan",
         "system"    => "系统",
         r           => r,
     };
-    let role_lbl = Label::new(Some(role_str));
-    role_lbl.add_css_class("msg-role");
-    if role == "assistant" {
-        role_lbl.add_css_class("msg-role-assistant");
-    }
-    role_lbl.set_halign(Align::Start);
-    outer.append(&role_lbl);
+    let lbl = Label::new(Some(role_str));
+    lbl.add_css_class("msg-role");
+    if role == "assistant" { lbl.add_css_class("msg-role-assistant"); }
+    lbl.set_halign(Align::Start);
+    lbl
+}
 
-    // Thinking block (historical only)
-    if let Some(think) = thinking.filter(|t| !t.is_empty()) {
-        let tbox = GBox::new(Orientation::Vertical, 2);
-        tbox.add_css_class("thinking-box");
-        let th = Label::new(Some("思考过程"));
-        th.add_css_class("thinking-header");
-        th.set_halign(Align::Start);
-        tbox.append(&th);
-        let tl = Label::new(Some(think));
-        tl.add_css_class("thinking-text");
-        tl.set_wrap(true);
-        tl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        tl.set_xalign(0.0);
-        tbox.append(&tl);
-        outer.append(&tbox);
+// Builds an interactive message widget with right-click context menu.
+// `user_text_for_regen` is only relevant for assistant messages.
+fn make_msg_widget_with_actions(
+    msg: &CoreMessage,
+    depth: i64,
+    order: i64,
+    user_text_for_regen: Option<String>,
+    state: &State,
+    ctx: &PanelCtx,
+) -> GBox {
+    let outer = GBox::new(Orientation::Vertical, 4);
+    outer.add_css_class(if msg.role == "user" { "msg-wrapper-user" } else { "msg-wrapper-assistant" });
+
+    outer.append(&msg_role_header(&msg.role));
+
+    // Thinking block for historical assistant messages
+    if msg.role == "assistant" {
+        if let Some(ref think) = msg.reasoning_content {
+            if !think.is_empty() {
+                let think_area = GBox::new(Orientation::Vertical, 0);
+                think_area.add_css_class("thinking-box");
+
+                // Collapsed toggle button
+                let toggle = Button::new();
+                toggle.add_css_class("think-toggle-btn");
+                toggle.set_label("▸ 深度思考");
+                think_area.append(&toggle);
+
+                let rev = Revealer::builder()
+                    .transition_type(RevealerTransitionType::SlideDown)
+                    .transition_duration(200)
+                    .reveal_child(false)
+                    .build();
+                let tc = GBox::new(Orientation::Vertical, 0);
+                tc.add_css_class("thinking-content");
+                let tl = Label::new(Some(think.as_str()));
+                tl.add_css_class("thinking-text");
+                tl.set_wrap(true);
+                tl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                tl.set_xalign(0.0);
+                tl.set_selectable(true);
+                tc.append(&tl);
+                rev.set_child(Some(&tc));
+                think_area.append(&rev);
+
+                let rev_c = rev.clone();
+                toggle.connect_clicked(move |_| {
+                    rev_c.set_reveal_child(!rev_c.reveals_child());
+                });
+
+                outer.append(&think_area);
+            }
+        }
     }
 
+    // Bubble content
     let bubble = GBox::new(Orientation::Vertical, 0);
-    bubble.add_css_class(if role == "user" {
-        "msg-bubble-user"
-    } else {
-        "msg-bubble-assistant"
-    });
+    bubble.add_css_class(if msg.role == "user" { "msg-bubble-user" } else { "msg-bubble-assistant" });
 
-    if role == "user" {
-        let lbl = Label::new(Some(content));
+    if msg.role == "user" {
+        let lbl = Label::new(Some(&msg.content));
         lbl.add_css_class("message-text");
         lbl.set_wrap(true);
         lbl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
@@ -498,74 +505,338 @@ fn make_message_widget(role: &str, content: &str, thinking: Option<&str>) -> GBo
         lbl.set_hexpand(true);
         bubble.append(&lbl);
     } else {
-        bubble.append(&build_markdown_widget(content));
+        bubble.append(&build_markdown_widget(&msg.content));
+    }
+    outer.append(&bubble);
+
+    // Right-click context menu
+    let pop = Popover::new();
+    pop.set_parent(&outer);
+    pop.add_css_class("context-menu-pop");
+    let pbx = GBox::new(Orientation::Vertical, 2);
+    pbx.add_css_class("context-menu");
+
+    if msg.role == "user" {
+        let edit_btn = Button::with_label("修改");
+        edit_btn.add_css_class("ctx-item");
+        let p       = pop.clone();
+        let bubble_c = bubble.clone();
+        let orig    = msg.content.clone();
+        let state_c = state.clone();
+        let ctx_c   = ctx.clone();
+        edit_btn.connect_clicked(move |_| {
+            p.popdown();
+            enable_edit_mode(&bubble_c, &orig, depth, &state_c, &ctx_c);
+        });
+        pbx.append(&edit_btn);
+    } else if msg.role == "assistant" {
+        if let Some(user_text) = user_text_for_regen {
+            let regen_btn = Button::with_label("重新生成");
+            regen_btn.add_css_class("ctx-item");
+            let p        = pop.clone();
+            let state_c  = state.clone();
+            let ctx_c    = ctx.clone();
+            regen_btn.connect_clicked(move |_| {
+                p.popdown();
+                if state_c.borrow().is_generating { return; }
+                let sid = match state_c.borrow().current_sid.clone() {
+                    Some(s) => s,
+                    None => return,
+                };
+                let next_order = state_c.borrow().session_store
+                    .get_next_order(&sid, depth)
+                    .unwrap_or(order + 1);
+                let dsv4f = ctx_c.dsv4f_btn.is_active();
+                do_send_branch(&state_c, user_text.clone(), vec![], depth, next_order, dsv4f, &ctx_c);
+            });
+            pbx.append(&regen_btn);
+        }
     }
 
-    outer.append(&bubble);
+    pop.set_child(Some(&pbx));
+
+    let gc  = GestureClick::new();
+    gc.set_button(3);
+    let pop_c = pop.clone();
+    gc.connect_pressed(move |_, _, x, y| {
+        let rect = gdk4::Rectangle::new(x as i32, y as i32, 1, 1);
+        pop_c.set_pointing_to(Some(&rect));
+        pop_c.popup();
+    });
+    outer.add_controller(gc);
+
     outer
 }
 
-// Streaming bubble: returns (outer, inner_bubble_box, text_label, thinking_label)
-// inner_bubble_box is replaced with markdown widget on Done.
-fn make_streaming_bubble(show_thinking: bool) -> (GBox, GBox, Label, Option<Label>) {
-    let outer = GBox::new(Orientation::Vertical, 4);
-    outer.add_css_class("msg-wrapper-assistant");
+// ─────────────────────────────────────────
+// Edit mode
+// ─────────────────────────────────────────
 
-    let role_lbl = Label::new(Some("Sakichan"));
-    role_lbl.add_css_class("msg-role");
-    role_lbl.add_css_class("msg-role-assistant");
-    role_lbl.set_halign(Align::Start);
-    outer.append(&role_lbl);
+fn enable_edit_mode(bubble: &GBox, original_text: &str, msg_depth: i64, state: &State, ctx: &PanelCtx) {
+    while let Some(c) = bubble.first_child() { bubble.remove(&c); }
 
-    let thinking_lbl = if show_thinking {
-        let tbox = GBox::new(Orientation::Vertical, 2);
-        tbox.add_css_class("thinking-box");
-        let th = Label::new(Some("思考过程"));
-        th.add_css_class("thinking-header");
-        th.set_halign(Align::Start);
-        tbox.append(&th);
-        let tl = Label::new(Some(""));
-        tl.add_css_class("thinking-text");
-        tl.set_wrap(true);
-        tl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        tl.set_xalign(0.0);
-        tbox.append(&tl);
-        outer.append(&tbox);
-        Some(tl)
-    } else {
-        None
-    };
+    let buf = TextBuffer::new(None);
+    buf.set_text(original_text);
+    let tv = TextView::with_buffer(&buf);
+    tv.add_css_class("edit-input");
+    tv.set_wrap_mode(WrapMode::WordChar);
+    tv.set_left_margin(8);
+    tv.set_right_margin(8);
+    tv.set_top_margin(8);
+    tv.set_bottom_margin(8);
+    tv.set_hexpand(true);
+    bubble.append(&tv);
 
-    let bubble = GBox::new(Orientation::Vertical, 0);
-    bubble.add_css_class("msg-bubble-assistant");
-    let text_lbl = Label::new(Some(""));
-    text_lbl.add_css_class("message-text");
-    text_lbl.set_wrap(true);
-    text_lbl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-    text_lbl.set_xalign(0.0);
-    text_lbl.set_yalign(0.0);
-    text_lbl.set_selectable(true);
-    text_lbl.set_hexpand(true);
-    bubble.append(&text_lbl);
-    outer.append(&bubble);
+    let btn_row = GBox::new(Orientation::Horizontal, 8);
+    btn_row.set_halign(Align::End);
+    btn_row.set_margin_top(6);
+    btn_row.set_margin_bottom(4);
+    let cancel_btn  = Button::with_label("取消");
+    cancel_btn.add_css_class("edit-cancel-btn");
+    let confirm_btn = Button::with_label("确认");
+    confirm_btn.add_css_class("edit-confirm-btn");
+    btn_row.append(&cancel_btn);
+    btn_row.append(&confirm_btn);
+    bubble.append(&btn_row);
+    tv.grab_focus();
 
-    (outer, bubble, text_lbl, thinking_lbl)
+    // Enter → confirm, Shift+Enter → newline
+    {
+        let sb_c = confirm_btn.clone();
+        let kc   = EventControllerKey::new();
+        kc.connect_key_pressed(move |_, key, _, mods| {
+            use gdk4::{Key, ModifierType};
+            if key == Key::Return {
+                if mods.contains(ModifierType::SHIFT_MASK) {
+                    glib::Propagation::Proceed
+                } else {
+                    sb_c.emit_clicked();
+                    glib::Propagation::Stop
+                }
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        tv.add_controller(kc);
+    }
+
+    // Cancel: restore original text
+    {
+        let bubble_c = bubble.clone();
+        let orig     = original_text.to_string();
+        cancel_btn.connect_clicked(move |_| {
+            while let Some(c) = bubble_c.first_child() { bubble_c.remove(&c); }
+            let lbl = Label::new(Some(&orig));
+            lbl.add_css_class("message-text");
+            lbl.set_wrap(true);
+            lbl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            lbl.set_xalign(0.0);
+            lbl.set_selectable(true);
+            lbl.set_hexpand(true);
+            bubble_c.append(&lbl);
+        });
+    }
+
+    // Confirm: branch send at msg_depth with a new order
+    {
+        let bubble_c = bubble.clone();
+        let state_c  = state.clone();
+        let ctx_c    = ctx.clone();
+        let buf_c    = buf.clone();
+        confirm_btn.connect_clicked(move |_| {
+            let text = {
+                let s = buf_c.start_iter();
+                let e = buf_c.end_iter();
+                buf_c.text(&s, &e, false).to_string()
+            };
+            let text = text.trim().to_string();
+            if text.is_empty() { return; }
+            if state_c.borrow().is_generating { return; }
+
+            let sid = match state_c.borrow().current_sid.clone() {
+                Some(s) => s,
+                None => return,
+            };
+            let next_order = state_c.borrow().session_store
+                .get_next_order(&sid, msg_depth)
+                .unwrap_or(2);
+
+            // Clear edit mode (show that something is happening)
+            while let Some(c) = bubble_c.first_child() { bubble_c.remove(&c); }
+            let pending = Label::new(Some(&text));
+            pending.add_css_class("message-text");
+            pending.set_wrap(true);
+            pending.set_xalign(0.0);
+            pending.set_hexpand(true);
+            bubble_c.append(&pending);
+
+            let dsv4f = ctx_c.dsv4f_btn.is_active();
+            do_send_branch(&state_c, text, vec![], msg_depth, next_order, dsv4f, &ctx_c);
+        });
+    }
 }
 
 // ─────────────────────────────────────────
-// Session list
+// Branch navigation
+// ─────────────────────────────────────────
+
+fn make_branch_nav(
+    session_id: &str,
+    depth: i64,
+    current_idx: usize,
+    orders: &[i64],
+    state: &State,
+    ctx: &PanelCtx,
+) -> GBox {
+    let total = orders.len();
+    let nav = GBox::new(Orientation::Horizontal, 8);
+    nav.add_css_class("branch-nav");
+
+    let left_btn = Button::with_label("←");
+    left_btn.add_css_class("branch-nav-btn");
+    left_btn.set_sensitive(current_idx > 0);
+
+    let lbl = Label::new(Some(&format!("分支 {} / {}", current_idx + 1, total)));
+    lbl.add_css_class("branch-nav-label");
+    lbl.set_hexpand(true);
+    lbl.set_halign(Align::Center);
+
+    let right_btn = Button::with_label("→");
+    right_btn.add_css_class("branch-nav-btn");
+    right_btn.set_sensitive(current_idx < total - 1);
+
+    nav.append(&left_btn);
+    nav.append(&lbl);
+    nav.append(&right_btn);
+
+    let switch = {
+        let sid   = session_id.to_string();
+        let state = state.clone();
+        let ctx   = ctx.clone();
+        move |new_order: i64| {
+            let _ = state.borrow().session_store.set_active_branch(&sid, depth, new_order);
+            let s = state.borrow().session_store.get_session(&sid).ok().flatten();
+            if let Some(sess) = s {
+                state.borrow_mut().current_sid = Some(sess.id.clone());
+                ctx.sess_title.set_text(sess.title.as_deref().unwrap_or("无标题"));
+                load_session_messages(&ctx, &sess, &state.borrow().session_store, &state);
+                scroll_to_bottom(&ctx.chat_scroll);
+            }
+        }
+    };
+
+    if current_idx > 0 {
+        let prev  = orders[current_idx - 1];
+        let sw    = switch.clone();
+        left_btn.connect_clicked(move |_| sw(prev));
+    }
+    if current_idx < total - 1 {
+        let next  = orders[current_idx + 1];
+        let sw    = switch.clone();
+        right_btn.connect_clicked(move |_| sw(next));
+    }
+
+    nav
+}
+
+// ─────────────────────────────────────────
+// Session / chat display
+// ─────────────────────────────────────────
+
+fn clear_chat(chat_box: &GBox) {
+    while let Some(c) = chat_box.first_child() {
+        chat_box.remove(&c);
+    }
+}
+
+fn show_welcome(chat_box: &GBox, text: &str) {
+    let lbl = Label::new(Some(text));
+    lbl.add_css_class("welcome-label");
+    lbl.set_vexpand(true);
+    lbl.set_valign(Align::Center);
+    lbl.set_halign(Align::Center);
+    chat_box.append(&lbl);
+}
+
+fn load_session_messages(
+    ctx: &PanelCtx,
+    session: &Session,
+    store: &SessionStore,
+    state: &State,
+) {
+    clear_chat(&ctx.chat_box);
+
+    let msgs = store
+        .get_branch_messages_with_coords(&session.id, session.active_depth, session.active_order)
+        .unwrap_or_default();
+
+    let orders_at_tip = if session.active_depth > 0 {
+        store.get_orders_at_depth(&session.id, session.active_depth)
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let mut nav_inserted = false;
+    let mut last_user_text = String::new();
+    let mut visible_count  = 0usize;
+
+    for (m, depth, _order) in &msgs {
+        if m.role == "system" { continue; }
+
+        // Insert branch nav before first message at active_depth (when multiple orders exist)
+        if *depth == session.active_depth && !nav_inserted && orders_at_tip.len() > 1 {
+            let curr_idx = orders_at_tip.iter()
+                .position(|&o| o == session.active_order)
+                .unwrap_or(0);
+            let nav = make_branch_nav(
+                &session.id, session.active_depth,
+                curr_idx, &orders_at_tip,
+                state, ctx,
+            );
+            ctx.chat_box.append(&nav);
+            nav_inserted = true;
+        }
+
+        if m.role == "user" { last_user_text = m.content.clone(); }
+        let user_text_for_regen = if m.role == "assistant" {
+            Some(last_user_text.clone())
+        } else {
+            None
+        };
+
+        let w = make_msg_widget_with_actions(m, *depth, _order.to_owned(), user_text_for_regen, state, ctx);
+        ctx.chat_box.append(&w);
+        visible_count += 1;
+    }
+
+    // Nav at bottom if there are multiple orders but no messages yet at active_depth
+    if !nav_inserted && orders_at_tip.len() > 1 {
+        let curr_idx = orders_at_tip.iter()
+            .position(|&o| o == session.active_order)
+            .unwrap_or(0);
+        let nav = make_branch_nav(
+            &session.id, session.active_depth,
+            curr_idx, &orders_at_tip,
+            state, ctx,
+        );
+        ctx.chat_box.append(&nav);
+    }
+
+    if visible_count == 0 {
+        show_welcome(&ctx.chat_box, "新会话已就绪，请输入消息");
+    }
+    scroll_to_bottom(&ctx.chat_scroll);
+}
+
+// ─────────────────────────────────────────
+// Context menu async actions
 // ─────────────────────────────────────────
 
 fn refresh_session_list(list: &ListBox, state: &State, ctx: &PanelCtx) {
-    while let Some(c) = list.first_child() {
-        list.remove(&c);
-    }
-    let sessions = state
-        .borrow()
-        .session_store
-        .list_sessions()
-        .unwrap_or_default();
-    let current = state.borrow().current_sid.clone();
+    while let Some(c) = list.first_child() { list.remove(&c); }
+    let sessions = state.borrow().session_store.list_sessions().unwrap_or_default();
+    let current  = state.borrow().current_sid.clone();
 
     for s in &sessions {
         let row = ListBoxRow::new();
@@ -596,12 +867,12 @@ fn refresh_session_list(list: &ListBox, state: &State, ctx: &PanelCtx) {
             list.select_row(Some(&row));
         }
 
-        // ── Right-click context menu ───────────────
-        let sid      = s.id.clone();
-        let list_c   = list.clone();
-        let state_c  = state.clone();
-        let ctx_c    = ctx.clone();
-        let row_c    = row.clone();
+        // Right-click context menu
+        let sid     = s.id.clone();
+        let list_c  = list.clone();
+        let state_c = state.clone();
+        let ctx_c   = ctx.clone();
+        let row_c   = row.clone();
 
         let pop = Popover::new();
         pop.set_parent(&row);
@@ -610,12 +881,12 @@ fn refresh_session_list(list: &ListBox, state: &State, ctx: &PanelCtx) {
         let pbx = GBox::new(Orientation::Vertical, 2);
         pbx.add_css_class("context-menu");
 
-        let del_btn  = Button::with_label("删除会话");
+        let del_btn = Button::with_label("删除会话");
         del_btn.add_css_class("ctx-item");
         del_btn.add_css_class("ctx-item-danger");
-        let cmp_btn  = Button::with_label("压缩对话");
+        let cmp_btn = Button::with_label("压缩对话");
         cmp_btn.add_css_class("ctx-item");
-        let ttl_btn  = Button::with_label("重新总结标题");
+        let ttl_btn = Button::with_label("重新总结标题");
         ttl_btn.add_css_class("ctx-item");
         pbx.append(&del_btn);
         pbx.append(&cmp_btn);
@@ -631,12 +902,8 @@ fn refresh_session_list(list: &ListBox, state: &State, ctx: &PanelCtx) {
             let ctx2   = ctx_c.clone();
             del_btn.connect_clicked(move |_| {
                 p.popdown();
-                {
-                    let st = state2.borrow();
-                    let _ = st.session_store.delete_session(&sid2);
-                }
-                let is_current = state2.borrow().current_sid.as_deref() == Some(&sid2);
-                if is_current {
+                let _ = state2.borrow().session_store.delete_session(&sid2);
+                if state2.borrow().current_sid.as_deref() == Some(&sid2) {
                     state2.borrow_mut().current_sid = None;
                     clear_chat(&ctx2.chat_box);
                     show_welcome(&ctx2.chat_box, "从左侧选择会话或创建新会话");
@@ -645,10 +912,9 @@ fn refresh_session_list(list: &ListBox, state: &State, ctx: &PanelCtx) {
                 refresh_session_list(&list2, &state2, &ctx2);
             });
         }
-
         // Compress
         {
-            let p      = pop.clone();
+            let p = pop.clone();
             let sid2   = sid.clone();
             let list2  = list_c.clone();
             let state2 = state_c.clone();
@@ -658,10 +924,9 @@ fn refresh_session_list(list: &ListBox, state: &State, ctx: &PanelCtx) {
                 start_compress(&state2, sid2.clone(), &list2, &ctx2);
             });
         }
-
         // Re-title
         {
-            let p      = pop.clone();
+            let p = pop.clone();
             let sid2   = sid.clone();
             let list2  = list_c.clone();
             let state2 = state_c.clone();
@@ -672,21 +937,17 @@ fn refresh_session_list(list: &ListBox, state: &State, ctx: &PanelCtx) {
             });
         }
 
-        // Show popover on right-click
         let gc = GestureClick::new();
         gc.set_button(3);
+        let pop_c = pop.clone();
         gc.connect_pressed(move |_, _, x, y| {
             let rect = gdk4::Rectangle::new(x as i32, y as i32, 1, 1);
-            pop.set_pointing_to(Some(&rect));
-            pop.popup();
+            pop_c.set_pointing_to(Some(&rect));
+            pop_c.popup();
         });
         row_c.add_controller(gc);
     }
 }
-
-// ─────────────────────────────────────────
-// Context menu async actions
-// ─────────────────────────────────────────
 
 fn start_compress(state: &State, session_id: String, list: &ListBox, ctx: &PanelCtx) {
     let ss  = state.borrow().session_store.clone();
@@ -698,37 +959,27 @@ fn start_compress(state: &State, session_id: String, list: &ListBox, ctx: &Panel
             Ok(Some(s)) => s,
             _ => { let _ = tx.send(Err("session not found".into())).await; return; }
         };
-        let msgs = ss
-            .get_branch_messages(&session_id, session.active_depth, session.active_order)
+        let msgs = ss.get_branch_messages(&session_id, session.active_depth, session.active_order)
             .unwrap_or_default();
         if msgs.is_empty() {
-            let _ = tx.send(Err("no messages to compress".into())).await;
-            return;
+            let _ = tx.send(Err("no messages".into())).await; return;
         }
         let prev = ss.get_latest_summary(&session_id).ok().flatten();
         let history: String = msgs.iter()
             .filter(|m| m.role != "system")
             .map(|m| format!("[{}]: {}", if m.role == "user" { "用户" } else { "助手" }, m.content))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let mut prompt_text = String::new();
+            .collect::<Vec<_>>().join("\n\n");
+        let mut pt = String::new();
         if let Some(p) = &prev {
-            prompt_text.push_str("以下是之前的对话总结（供参考）：\n\n");
-            prompt_text.push_str(&p.content);
-            prompt_text.push_str("\n\n---\n\n");
+            pt.push_str("以下是之前的对话总结（供参考）：\n\n");
+            pt.push_str(&p.content);
+            pt.push_str("\n\n---\n\n");
         }
-        prompt_text.push_str("请对以下对话内容生成精准简洁的总结：\n\n");
-        prompt_text.push_str(&history);
-        let prompt_msgs = vec![CoreMessage::user(prompt_text)];
-        match call_model_text(cfg, "sensenova-flash-lite", prompt_msgs).await {
+        pt.push_str("请对以下对话内容生成精准简洁的总结：\n\n");
+        pt.push_str(&history);
+        match call_model_text(cfg, "sensenova-flash-lite", vec![CoreMessage::user(pt)]).await {
             Ok(summary) => {
-                let _ = ss.save_summary(
-                    &session_id,
-                    session.active_depth,
-                    session.active_order,
-                    summary.trim(),
-                    msgs.len(),
-                );
+                let _ = ss.save_summary(&session_id, session.active_depth, session.active_order, summary.trim(), msgs.len());
                 let _ = tx.send(Ok(())).await;
             }
             Err(e) => { let _ = tx.send(Err(e)).await; }
@@ -748,35 +999,28 @@ fn start_compress(state: &State, session_id: String, list: &ListBox, ctx: &Panel
 }
 
 fn start_retitle(state: &State, session_id: String, list: &ListBox, ctx: &PanelCtx) {
-    let ss  = state.borrow().session_store.clone();
-    let cfg = state.borrow().config.clone();
+    let ss          = state.borrow().session_store.clone();
+    let cfg         = state.borrow().config.clone();
     let current_sid = state.borrow().current_sid.clone();
     let sid_check   = session_id.clone();
-    let (tx, rx) = async_channel::unbounded::<Result<String, String>>();
+    let (tx, rx)    = async_channel::unbounded::<Result<String, String>>();
 
     rt().spawn(async move {
         let session = match ss.get_session(&session_id) {
             Ok(Some(s)) => s,
             _ => { let _ = tx.send(Err("session not found".into())).await; return; }
         };
-        let msgs = ss
-            .get_branch_messages(&session_id, session.active_depth, session.active_order)
+        let msgs = ss.get_branch_messages(&session_id, session.active_depth, session.active_order)
             .unwrap_or_default();
-        let hist: String = msgs.iter()
-            .filter(|m| m.role != "system")
-            .take(8)
+        let hist: String = msgs.iter().filter(|m| m.role != "system").take(8)
             .map(|m| {
-                let preview = m.content.char_indices().nth(200)
-                    .map(|(i,_)| &m.content[..i])
-                    .unwrap_or(&m.content);
-                format!("[{}]: {}", if m.role == "user" { "用户" } else { "助手" }, preview)
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let prompt_msgs = vec![CoreMessage::user(format!(
+                let p = m.content.char_indices().nth(200).map(|(i,_)| &m.content[..i]).unwrap_or(&m.content);
+                format!("[{}]: {}", if m.role == "user" { "用户" } else { "助手" }, p)
+            }).collect::<Vec<_>>().join("\n\n");
+        let pmsg = vec![CoreMessage::user(format!(
             "请为以下对话生成一个简洁的标题（不超过20个字，直接输出标题，不要加引号或解释）：\n\n{hist}"
         ))];
-        match call_model_text(cfg, "sensenova-flash-lite", prompt_msgs).await {
+        match call_model_text(cfg, "sensenova-flash-lite", pmsg).await {
             Ok(title) => {
                 let title = title.trim().to_string();
                 let _ = ss.update_title(&session_id, &title);
@@ -806,43 +1050,6 @@ fn start_retitle(state: &State, session_id: String, list: &ListBox, ctx: &PanelC
 }
 
 // ─────────────────────────────────────────
-// Chat display
-// ─────────────────────────────────────────
-
-fn clear_chat(chat_box: &GBox) {
-    while let Some(c) = chat_box.first_child() {
-        chat_box.remove(&c);
-    }
-}
-
-fn load_session_messages(ctx: &PanelCtx, session: &Session, store: &SessionStore) {
-    clear_chat(&ctx.chat_box);
-    let msgs = store
-        .get_branch_messages(&session.id, session.active_depth, session.active_order)
-        .unwrap_or_default();
-
-    for m in msgs.iter().filter(|m| m.role != "system") {
-        let thinking = m.reasoning_content.as_deref();
-        let w = make_message_widget(&m.role, &m.content, thinking);
-        ctx.chat_box.append(&w);
-    }
-
-    if msgs.is_empty() {
-        show_welcome(&ctx.chat_box, "新会话已就绪，请输入消息");
-    }
-    scroll_to_bottom(&ctx.chat_scroll);
-}
-
-fn show_welcome(chat_box: &GBox, text: &str) {
-    let lbl = Label::new(Some(text));
-    lbl.add_css_class("welcome-label");
-    lbl.set_vexpand(true);
-    lbl.set_valign(Align::Center);
-    lbl.set_halign(Align::Center);
-    chat_box.append(&lbl);
-}
-
-// ─────────────────────────────────────────
 // Attachment chips
 // ─────────────────────────────────────────
 
@@ -855,21 +1062,13 @@ fn add_chip(bar: &GBox, rev: &Revealer, state: &State, label: &str, is_image: bo
     rm.add_css_class("attach-remove-btn");
     chip.append(&rm);
 
-    let bar_c   = bar.clone();
-    let rev_c   = rev.clone();
-    let state_c = state.clone();
-    let chip_c  = chip.clone();
-    let key_c   = key.clone();
+    let bar_c = bar.clone(); let rev_c = rev.clone();
+    let state_c = state.clone(); let chip_c = chip.clone(); let key_c = key.clone();
     rm.connect_clicked(move |_| {
-        if is_image {
-            state_c.borrow_mut().pending_imgs.retain(|(n, _)| n != &key_c);
-        } else {
-            state_c.borrow_mut().pending_files.retain(|p| p != &key_c);
-        }
+        if is_image { state_c.borrow_mut().pending_imgs.retain(|(n,_)| n != &key_c); }
+        else        { state_c.borrow_mut().pending_files.retain(|p| p != &key_c); }
         bar_c.remove(&chip_c);
-        if bar_c.first_child().is_none() {
-            rev_c.set_reveal_child(false);
-        }
+        if bar_c.first_child().is_none() { rev_c.set_reveal_child(false); }
     });
     bar.append(&chip);
     rev.set_reveal_child(true);
@@ -897,25 +1096,249 @@ fn pick_file(state: &State, bar: &GBox, rev: &Revealer, path: PathBuf) {
 // Streaming events
 // ─────────────────────────────────────────
 
-enum Msg {
-    Token(String),
-    Think(String),
-    Done,
-    Fail(String),
+enum Msg { Token(String), Think(String), Done, Fail(String) }
+
+// ─────────────────────────────────────────
+// Streaming bubble builder
+// ─────────────────────────────────────────
+
+struct StreamBubble {
+    outer:        GBox,
+    bubble:       GBox,
+    think_toggle: Option<Button>,
+    think_lbl:    Option<Label>,
+}
+
+fn make_streaming_bubble(show_thinking: bool) -> StreamBubble {
+    let outer = GBox::new(Orientation::Vertical, 4);
+    outer.add_css_class("msg-wrapper-assistant");
+
+    let role_lbl = Label::new(Some("Sakichan"));
+    role_lbl.add_css_class("msg-role");
+    role_lbl.add_css_class("msg-role-assistant");
+    role_lbl.set_halign(Align::Start);
+    outer.append(&role_lbl);
+
+    // Thinking section (collapsed by default, only when thinking mode on)
+    let (think_toggle, think_lbl) = if show_thinking {
+        let area = GBox::new(Orientation::Vertical, 0);
+        area.add_css_class("thinking-box");
+
+        let toggle = Button::new();
+        toggle.add_css_class("think-toggle-btn");
+        toggle.set_label("▸ 深度思考中…");
+        area.append(&toggle);
+
+        let rev = Revealer::builder()
+            .transition_type(RevealerTransitionType::SlideDown)
+            .transition_duration(200)
+            .reveal_child(false)
+            .build();
+        let tc = GBox::new(Orientation::Vertical, 0);
+        tc.add_css_class("thinking-content");
+        let tl = Label::new(Some(""));
+        tl.add_css_class("thinking-text");
+        tl.set_wrap(true);
+        tl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        tl.set_xalign(0.0);
+        tl.set_selectable(true);
+        tc.append(&tl);
+        rev.set_child(Some(&tc));
+        area.append(&rev);
+
+        let rev_c = rev.clone();
+        toggle.connect_clicked(move |_| {
+            rev_c.set_reveal_child(!rev_c.reveals_child());
+        });
+
+        outer.append(&area);
+        (Some(toggle), Some(tl))
+    } else {
+        (None, None)
+    };
+
+    // Main bubble: starts with loading spinner
+    let bubble = GBox::new(Orientation::Vertical, 0);
+    bubble.add_css_class("msg-bubble-assistant");
+
+    let loading = GBox::new(Orientation::Horizontal, 8);
+    loading.add_css_class("loading-box");
+    loading.set_margin_start(4);
+    loading.set_margin_top(6);
+    loading.set_margin_bottom(6);
+    let sp = Spinner::new();
+    sp.start();
+    sp.add_css_class("loading-spinner");
+    loading.append(&sp);
+    let ll = Label::new(Some("生成中…"));
+    ll.add_css_class("loading-label");
+    loading.append(&ll);
+    bubble.append(&loading);
+
+    outer.append(&bubble);
+    StreamBubble { outer, bubble, think_toggle, think_lbl }
 }
 
 // ─────────────────────────────────────────
-// Send handler
+// Common streaming receive loop
+// ─────────────────────────────────────────
+
+fn spawn_stream_receiver(
+    rx:            async_channel::Receiver<Msg>,
+    sb:            StreamBubble,
+    state:         State,
+    ctx:           PanelCtx,
+    sid:           String,
+    reload_on_done: bool,   // true → reload session messages after Done
+) {
+    let bubble2   = sb.bubble.clone();
+    let think_tog = sb.think_toggle.clone();
+    let think_lbl = sb.think_lbl.clone();
+    let scroll2   = ctx.chat_scroll.clone();
+    let send_btn2 = ctx.send_btn.clone();
+    let sl2       = ctx.session_list.clone();
+    let state2    = state.clone();
+    let ctx2      = ctx.clone();
+    let sid2      = sid.clone();
+
+    let tbuf        = Rc::new(RefCell::new(String::new()));
+    let thbuf       = Rc::new(RefCell::new(String::new()));
+    let first_tok   = Rc::new(RefCell::new(true));
+    let last_rend   = Rc::new(RefCell::new(Instant::now()));
+    let think_start : Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
+
+    glib::MainContext::default().spawn_local(async move {
+        while let Ok(msg) = rx.recv().await {
+            match msg {
+                Msg::Token(t) => {
+                    tbuf.borrow_mut().push_str(&t);
+
+                    if *first_tok.borrow() {
+                        *first_tok.borrow_mut() = false;
+                        let text = tbuf.borrow().clone();
+                        while let Some(c) = bubble2.first_child() { bubble2.remove(&c); }
+                        bubble2.append(&build_markdown_widget(&text));
+                        scroll_to_bottom(&scroll2);
+                        *last_rend.borrow_mut() = Instant::now();
+                    } else {
+                        let now = Instant::now();
+                        if now.duration_since(*last_rend.borrow()) >= Duration::from_millis(180) {
+                            let text = tbuf.borrow().clone();
+                            while let Some(c) = bubble2.first_child() { bubble2.remove(&c); }
+                            bubble2.append(&build_markdown_widget(&text));
+                            scroll_to_bottom(&scroll2);
+                            *last_rend.borrow_mut() = now;
+                        }
+                    }
+                }
+                Msg::Think(t) => {
+                    if think_start.borrow().is_none() {
+                        *think_start.borrow_mut() = Some(Instant::now());
+                    }
+                    thbuf.borrow_mut().push_str(&t);
+                    if let Some(ref tl) = think_lbl {
+                        tl.set_text(thbuf.borrow().as_str());
+                    }
+                }
+                Msg::Done => {
+                    state2.borrow_mut().is_generating = false;
+                    send_btn2.set_sensitive(true);
+
+                    // Final markdown render
+                    let final_text = tbuf.borrow().clone();
+                    while let Some(c) = bubble2.first_child() { bubble2.remove(&c); }
+                    bubble2.append(&build_markdown_widget(&final_text));
+                    scroll_to_bottom(&scroll2);
+
+                    // Update thinking toggle with elapsed time
+                    if let Some(ref tb) = think_tog {
+                        let secs = think_start.borrow()
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        tb.set_label(&format!("▸ 深度思考 (用时 {}s)", secs));
+                    }
+
+                    // Reload session messages on Done (used for branch sends)
+                    if reload_on_done {
+                        let session = state2.borrow().session_store
+                            .get_session(&sid2).ok().flatten();
+                        if let Some(s) = session {
+                            load_session_messages(&ctx2, &s, &state2.borrow().session_store, &state2);
+                        }
+                    }
+
+                    // Auto-title if untitled
+                    let needs_title = {
+                        let st = state2.borrow();
+                        st.session_store.get_session(&sid2)
+                            .ok().flatten()
+                            .map(|s| s.title.is_none())
+                            .unwrap_or(false)
+                    };
+                    if needs_title {
+                        let ss2  = state2.borrow().session_store.clone();
+                        let cfg2 = state2.borrow().config.clone();
+                        let (ttx, trx) = async_channel::unbounded::<String>();
+                        let sid3 = sid2.clone();
+                        rt().spawn(async move {
+                            let msgs = match ss2.get_session(&sid3) {
+                                Ok(Some(s)) => ss2.get_branch_messages(&sid3, s.active_depth, s.active_order).unwrap_or_default(),
+                                _ => return,
+                            };
+                            let hist: String = msgs.iter().filter(|m| m.role != "system").take(6)
+                                .map(|m| {
+                                    let p = m.content.char_indices().nth(200).map(|(i,_)| &m.content[..i]).unwrap_or(&m.content);
+                                    format!("[{}]: {}", if m.role == "user" { "用户" } else { "助手" }, p)
+                                }).collect::<Vec<_>>().join("\n\n");
+                            let pmsg = vec![CoreMessage::user(format!(
+                                "请为以下对话生成一个简洁的标题（不超过20个字，直接输出标题，不要加引号或解释）：\n\n{hist}"
+                            ))];
+                            if let Ok(title) = call_model_text(cfg2, "sensenova-flash-lite", pmsg).await {
+                                let title = title.trim().to_string();
+                                let _ = ss2.update_title(&sid3, &title);
+                                let _ = ttx.send(title).await;
+                            }
+                        });
+                        let ctx3   = ctx2.clone();
+                        let state3 = state2.clone();
+                        let sl3    = sl2.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            if let Ok(title) = trx.recv().await {
+                                ctx3.sess_title.set_text(&title);
+                                refresh_session_list(&sl3, &state3, &ctx3);
+                            }
+                        });
+                    }
+
+                    refresh_session_list(&sl2, &state2, &ctx2);
+                    break;
+                }
+                Msg::Fail(e) => {
+                    eprintln!("gen error: {e}");
+                    while let Some(c) = bubble2.first_child() { bubble2.remove(&c); }
+                    let err = Label::new(Some(&format!("[错误: {e}]")));
+                    err.add_css_class("message-text");
+                    err.set_xalign(0.0);
+                    bubble2.append(&err);
+                    state2.borrow_mut().is_generating = false;
+                    send_btn2.set_sensitive(true);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+// ─────────────────────────────────────────
+// Main send handler
 // ─────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 fn do_send(
     state:        &State,
     input_buf:    &TextBuffer,
-    session_list: &ListBox,
     attach_rev:   &Revealer,
     attach_bar:   &GBox,
-    send_btn:     &Button,
     dsv4f:        bool,
     thinking:     bool,
     ctx:          &PanelCtx,
@@ -930,12 +1353,10 @@ fn do_send(
     let text = text.trim().to_string();
     if text.is_empty() { return; }
 
-    // Resolve or create session
     let sid = {
         let mut st = state.borrow_mut();
-        if let Some(id) = st.current_sid.clone() {
-            id
-        } else {
+        if let Some(id) = st.current_sid.clone() { id }
+        else {
             match st.session_store.create_session("sensenova-flash-lite", None) {
                 Ok(s) => { st.current_sid = Some(s.id.clone()); s.id }
                 Err(e) => { eprintln!("create session: {e}"); return; }
@@ -943,7 +1364,6 @@ fn do_send(
         }
     };
 
-    // Drain attachments
     let imgs: Vec<String>;
     let files: Vec<String>;
     {
@@ -957,9 +1377,8 @@ fn do_send(
     while let Some(c) = attach_bar.first_child() { attach_bar.remove(&c); }
     attach_rev.set_reveal_child(false);
     input_buf.set_text("");
-    send_btn.set_sensitive(false);
+    ctx.send_btn.set_sensitive(false);
 
-    // File context prefix
     let file_prefix: Option<String> = {
         let parts: Vec<_> = files.iter()
             .filter_map(|p| std::fs::read_to_string(p).ok().map(|c| format!("[文件: {p}]\n{c}")))
@@ -971,14 +1390,16 @@ fn do_send(
         None     => text.clone(),
     };
 
-    // User message bubble
-    let uw = make_message_widget("user", &full_text, None);
+    // User message widget
+    let uw = make_msg_widget_with_actions(
+        &CoreMessage::user(&full_text), 0, 0, None, state, ctx,
+    );
     ctx.chat_box.append(&uw);
     scroll_to_bottom(&ctx.chat_scroll);
 
-    // Assistant streaming bubble
-    let (aw, bubble_box, asst_lbl, think_lbl_opt) = make_streaming_bubble(thinking);
-    ctx.chat_box.append(&aw);
+    // Streaming bubble
+    let sb = make_streaming_bubble(thinking);
+    ctx.chat_box.append(&sb.outer);
     scroll_to_bottom(&ctx.chat_scroll);
 
     let (tx, rx) = async_channel::unbounded::<Msg>();
@@ -998,7 +1419,6 @@ fn do_send(
             Ok(Some(s)) => s,
             _ => { let _ = tx2.send(Msg::Fail("session not found".into())).await; return; }
         };
-
         let next_depth = ss.get_max_depth(&sid_c).unwrap_or(0) + 1;
         let next_order = 1i64;
         let _ = ss.set_active_branch(&sid_c, next_depth, next_order);
@@ -1010,138 +1430,104 @@ fn do_send(
 
         let mut sctx = SessionContext::new(sid_c.clone(), mid.clone());
         sctx.set_system_prompt(session.system_prompt.clone());
-        let branch = ss
-            .get_branch_messages(&sid_c, session.active_depth, session.active_order)
-            .unwrap_or_default();
-        if !branch.is_empty() {
-            sctx.load_messages(branch);
-        }
+        let branch = ss.get_branch_messages(&sid_c, session.active_depth, session.active_order).unwrap_or_default();
+        if !branch.is_empty() { sctx.load_messages(branch); }
         sctx.set_branch_mode(next_depth, next_order);
 
         let mut pipeline = PipelineContext::new(sctx, ss, ms, top_k);
         let tx3 = tx2.clone();
-        let res = pipeline
-            .run(&full_text_c, imgs_c, &*model, &mut move |ev| match ev {
-                PipelineEvent::Token(t)          => { let _ = tx3.send_blocking(Msg::Token(t)); }
-                PipelineEvent::ReasoningToken(t) => { let _ = tx3.send_blocking(Msg::Think(t)); }
-                PipelineEvent::Done(_)           => { let _ = tx3.send_blocking(Msg::Done); }
-                PipelineEvent::Error(e)          => { let _ = tx3.send_blocking(Msg::Fail(e)); }
-                _ => {}
-            })
-            .await;
+        let res = pipeline.run(&full_text_c, imgs_c, &*model, &mut move |ev| match ev {
+            PipelineEvent::Token(t)          => { let _ = tx3.send_blocking(Msg::Token(t)); }
+            PipelineEvent::ReasoningToken(t) => { let _ = tx3.send_blocking(Msg::Think(t)); }
+            PipelineEvent::Done(_)           => { let _ = tx3.send_blocking(Msg::Done); }
+            PipelineEvent::Error(e)          => { let _ = tx3.send_blocking(Msg::Fail(e)); }
+            _ => {}
+        }).await;
 
         if let Err(e) = res {
             let _ = tx2.send(Msg::Fail(format!("{e}"))).await;
         }
     });
 
-    // Receive on GTK main context
-    let tbuf       = Rc::new(RefCell::new(String::new()));
-    let thbuf      = Rc::new(RefCell::new(String::new()));
-    let asst_lbl2  = asst_lbl.clone();
-    let think_opt2 = think_lbl_opt.clone();
-    let send_btn2  = send_btn.clone();
-    let scroll2    = ctx.chat_scroll.clone();
-    let sl2        = session_list.clone();
-    let bubble2    = bubble_box.clone();
-    let state2     = state.clone();
-    let ctx2       = ctx.clone();
-    let sid2       = sid.clone();
+    spawn_stream_receiver(rx, sb, state.clone(), ctx.clone(), sid, false);
+}
 
-    glib::MainContext::default().spawn_local(async move {
-        while let Ok(msg) = rx.recv().await {
-            match msg {
-                Msg::Token(t) => {
-                    tbuf.borrow_mut().push_str(&t);
-                    asst_lbl2.set_text(tbuf.borrow().as_str());
-                    scroll_to_bottom(&scroll2);
-                }
-                Msg::Think(t) => {
-                    thbuf.borrow_mut().push_str(&t);
-                    if let Some(ref tl) = think_opt2 {
-                        tl.set_text(thbuf.borrow().as_str());
-                    }
-                }
-                Msg::Done => {
-                    state2.borrow_mut().is_generating = false;
-                    send_btn2.set_sensitive(true);
+// Branch send: send at a specific (depth, order) with explicit history loading
+fn do_send_branch(
+    state:    &State,
+    text:     String,
+    imgs:     Vec<String>,
+    depth:    i64,
+    order:    i64,
+    dsv4f:    bool,
+    ctx:      &PanelCtx,
+) {
+    if state.borrow().is_generating { return; }
 
-                    // Replace streaming label with markdown-rendered widget
-                    let final_text = tbuf.borrow().clone();
-                    while let Some(c) = bubble2.first_child() { bubble2.remove(&c); }
-                    bubble2.append(&build_markdown_widget(&final_text));
-                    scroll_to_bottom(&scroll2);
+    let sid = match state.borrow().current_sid.clone() {
+        Some(s) => s,
+        None    => return,
+    };
 
-                    // Auto-title if session still untitled
-                    let needs_title = {
-                        let st = state2.borrow();
-                        st.session_store.get_session(&sid2)
-                            .ok().flatten()
-                            .map(|s| s.title.is_none())
-                            .unwrap_or(false)
-                    };
-                    if needs_title {
-                        let ss2  = state2.borrow().session_store.clone();
-                        let cfg2 = state2.borrow().config.clone();
-                        let (ttx, trx) = async_channel::unbounded::<String>();
-                        let sid3 = sid2.clone();
+    state.borrow_mut().is_generating = true;
+    ctx.send_btn.set_sensitive(false);
 
-                        rt().spawn(async move {
-                            let msgs = match ss2.get_session(&sid3) {
-                                Ok(Some(s)) => ss2.get_branch_messages(
-                                    &sid3, s.active_depth, s.active_order).unwrap_or_default(),
-                                _ => return,
-                            };
-                            let hist: String = msgs.iter()
-                                .filter(|m| m.role != "system")
-                                .take(6)
-                                .map(|m| {
-                                    let preview = m.content.char_indices().nth(200)
-                                        .map(|(i,_)| &m.content[..i])
-                                        .unwrap_or(&m.content);
-                                    format!("[{}]: {}", if m.role == "user" { "用户" } else { "助手" }, preview)
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n\n");
-                            let pmsg = vec![CoreMessage::user(format!(
-                                "请为以下对话生成一个简洁的标题（不超过20个字，直接输出标题，不要加引号或解释）：\n\n{hist}"
-                            ))];
-                            if let Ok(title) = call_model_text(cfg2, "sensenova-flash-lite", pmsg).await {
-                                let title = title.trim().to_string();
-                                let _ = ss2.update_title(&sid3, &title);
-                                let _ = ttx.send(title).await;
-                            }
-                        });
+    // Streaming bubble (appended at bottom)
+    let sb = make_streaming_bubble(false);
+    ctx.chat_box.append(&sb.outer);
+    scroll_to_bottom(&ctx.chat_scroll);
 
-                        let ctx3   = ctx2.clone();
-                        let state3 = state2.clone();
-                        let sl3    = sl2.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            if let Ok(title) = trx.recv().await {
-                                ctx3.sess_title.set_text(&title);
-                                refresh_session_list(&sl3, &state3, &ctx3);
-                            }
-                        });
-                    }
+    let (tx, rx) = async_channel::unbounded::<Msg>();
 
-                    refresh_session_list(&sl2, &state2, &ctx2);
-                    break;
-                }
-                Msg::Fail(e) => {
-                    eprintln!("gen error: {e}");
-                    // Replace streaming label with error text
-                    while let Some(c) = bubble2.first_child() { bubble2.remove(&c); }
-                    let err_lbl = Label::new(Some(&format!("[错误: {e}]")));
-                    err_lbl.add_css_class("message-text");
-                    err_lbl.set_xalign(0.0);
-                    bubble2.append(&err_lbl);
-                    state2.borrow_mut().is_generating = false;
-                    send_btn2.set_sensitive(true);
-                    break;
-                }
-            }
+    let ss    = state.borrow().session_store.clone();
+    let ms    = state.borrow().memory_store.clone();
+    let cfg   = state.borrow().config.clone();
+    let top_k = cfg.memory.retrieval_top_k;
+    let mid   = if dsv4f { "deepseek-v4-flash" } else { "sensenova-flash-lite" }.to_string();
+    let text_c = text.clone();
+    let sid_c  = sid.clone();
+    let tx2    = tx.clone();
+
+    rt().spawn(async move {
+        let session = match ss.get_session(&sid_c) {
+            Ok(Some(s)) => s,
+            _ => { let _ = tx2.send(Msg::Fail("session not found".into())).await; return; }
+        };
+
+        // Load history up to depth-1 (on the current active path)
+        let history = if depth > 1 {
+            ss.get_branch_messages(&sid_c, depth - 1, session.active_order).unwrap_or_default()
+        } else { vec![] };
+
+        let _ = ss.set_active_branch(&sid_c, depth, order);
+
+        let model = match make_model(&cfg, &mid) {
+            Ok(m) => m,
+            Err(e) => { let _ = tx2.send(Msg::Fail(format!("{e}"))).await; return; }
+        };
+
+        let mut sctx = SessionContext::new(sid_c.clone(), mid.clone());
+        sctx.set_system_prompt(session.system_prompt.clone());
+        if !history.is_empty() { sctx.load_messages(history); }
+        sctx.set_branch_mode(depth, order);
+
+        let mut pipeline = PipelineContext::new(sctx, ss, ms, top_k);
+        let tx3 = tx2.clone();
+        let res = pipeline.run(&text_c, imgs, &*model, &mut move |ev| match ev {
+            PipelineEvent::Token(t)          => { let _ = tx3.send_blocking(Msg::Token(t)); }
+            PipelineEvent::ReasoningToken(t) => { let _ = tx3.send_blocking(Msg::Think(t)); }
+            PipelineEvent::Done(_)           => { let _ = tx3.send_blocking(Msg::Done); }
+            PipelineEvent::Error(e)          => { let _ = tx3.send_blocking(Msg::Fail(e)); }
+            _ => {}
+        }).await;
+
+        if let Err(e) = res {
+            let _ = tx2.send(Msg::Fail(format!("{e}"))).await;
         }
     });
+
+    // reload_on_done=true → reload session messages when generation finishes
+    spawn_stream_receiver(rx, sb, state.clone(), ctx.clone(), sid, true);
 }
 
 // ─────────────────────────────────────────
@@ -1149,7 +1535,6 @@ fn do_send(
 // ─────────────────────────────────────────
 
 fn build_ui(app: &Application) {
-    // CSS
     let css = CssProvider::new();
     css.load_from_string(include_str!("style.css"));
     gtk4::style_context_add_provider_for_display(
@@ -1158,13 +1543,9 @@ fn build_ui(app: &Application) {
         STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    // State
     let state: State = match AppState::init() {
-        Ok(s) => Rc::new(RefCell::new(s)),
-        Err(e) => {
-            eprintln!("init error: {e}");
-            return;
-        }
+        Ok(s)  => Rc::new(RefCell::new(s)),
+        Err(e) => { eprintln!("init error: {e}"); return; }
     };
 
     // ── Window ────────────────────────────────────────────────
@@ -1178,13 +1559,12 @@ fn build_ui(app: &Application) {
 
     let overlay = Overlay::new();
 
-    // ── Main column ───────────────────────────────────────────
     let main_col = GBox::new(Orientation::Vertical, 0);
     main_col.set_hexpand(true);
     main_col.set_vexpand(true);
     overlay.set_child(Some(&main_col));
 
-    // ── Header bar ────────────────────────────────────────────
+    // ── Header ───────────────────────────────────────────────
     let header = GBox::new(Orientation::Horizontal, 0);
     header.add_css_class("header-bar");
 
@@ -1199,16 +1579,14 @@ fn build_ui(app: &Application) {
     sess_title.set_margin_start(16);
     sess_title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     header.append(&sess_title);
-
     main_col.append(&header);
 
-    // ── Body ──────────────────────────────────────────────────
+    // ── Body ─────────────────────────────────────────────────
     let body = GBox::new(Orientation::Vertical, 0);
     body.set_vexpand(true);
     body.set_hexpand(true);
     main_col.append(&body);
 
-    // Chat scroll
     let chat_scroll = ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(PolicyType::Never)
@@ -1222,13 +1600,6 @@ fn build_ui(app: &Application) {
     show_welcome(&chat_box, "从左侧选择会话或创建新会话");
     chat_scroll.set_child(Some(&chat_box));
     body.append(&chat_scroll);
-
-    // Panel context (shared UI refs)
-    let panel_ctx = PanelCtx {
-        chat_box:    chat_box.clone(),
-        chat_scroll: chat_scroll.clone(),
-        sess_title:  sess_title.clone(),
-    };
 
     // Attachment revealer
     let attach_rev = Revealer::builder()
@@ -1253,7 +1624,7 @@ fn build_ui(app: &Application) {
         .build();
     input_scroll.add_css_class("input-scroll");
 
-    let input_buf = TextBuffer::new(None);
+    let input_buf  = TextBuffer::new(None);
     let input_view = TextView::with_buffer(&input_buf);
     input_view.add_css_class("input-text");
     input_view.set_wrap_mode(WrapMode::WordChar);
@@ -1265,7 +1636,6 @@ fn build_ui(app: &Application) {
     input_scroll.set_child(Some(&input_view));
     input_con.append(&input_scroll);
 
-    // Button row
     let btn_row = GBox::new(Orientation::Horizontal, 8);
     btn_row.add_css_class("btn-row");
 
@@ -1302,7 +1672,6 @@ fn build_ui(app: &Application) {
     body.append(&input_con);
 
     // ── Overlays: dim + sidebar ───────────────────────────────
-
     let dim = GBox::new(Orientation::Horizontal, 0);
     dim.add_css_class("dim-overlay");
     dim.set_halign(Align::Fill);
@@ -1322,7 +1691,7 @@ fn build_ui(app: &Application) {
     let sidebar = GBox::new(Orientation::Vertical, 0);
     sidebar.add_css_class("sidebar");
 
-    // ── API KEY section ────────────────────────────────────────
+    // API KEY section
     let ak_section = GBox::new(Orientation::Vertical, 6);
     ak_section.add_css_class("apikey-section");
 
@@ -1341,7 +1710,7 @@ fn build_ui(app: &Application) {
     ak_entry.add_css_class("apikey-entry");
     ak_section.append(&ak_entry);
 
-    let ak_btns = GBox::new(Orientation::Horizontal, 6);
+    let ak_btns  = GBox::new(Orientation::Horizontal, 6);
     let ak_write = Button::with_label("写入");
     ak_write.add_css_class("apikey-write-btn");
     ak_write.set_hexpand(true);
@@ -1351,10 +1720,9 @@ fn build_ui(app: &Application) {
     ak_btns.append(&ak_write);
     ak_btns.append(&ak_clear);
     ak_section.append(&ak_btns);
-
     sidebar.append(&ak_section);
 
-    // ── Sidebar header ─────────────────────────────────────────
+    // Session list header
     let sb_hdr = GBox::new(Orientation::Horizontal, 0);
     sb_hdr.add_css_class("sidebar-header");
     let sb_lbl = Label::new(Some("会话列表"));
@@ -1383,6 +1751,16 @@ fn build_ui(app: &Application) {
 
     win.set_child(Some(&overlay));
 
+    // Panel context (shared UI refs)
+    let panel_ctx = PanelCtx {
+        chat_box:     chat_box.clone(),
+        chat_scroll:  chat_scroll.clone(),
+        sess_title:   sess_title.clone(),
+        session_list: session_list.clone(),
+        send_btn:     send_btn.clone(),
+        dsv4f_btn:    dsv4f_btn.clone(),
+    };
+
     // ════════════════════════════════════════
     // Signal connections
     // ════════════════════════════════════════
@@ -1397,7 +1775,7 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Hamburger → toggle sidebar
+    // Hamburger → sidebar
     {
         let sr = sidebar_rev.clone();
         let d  = dim.clone();
@@ -1408,7 +1786,7 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Dim click → close sidebar
+    // Dim → close sidebar
     {
         let gc = GestureClick::new();
         let sr = sidebar_rev.clone();
@@ -1422,32 +1800,32 @@ fn build_ui(app: &Application) {
 
     // Write API key
     {
-        let entry_c  = ak_entry.clone();
-        let status_c = ak_status.clone();
-        let state2   = state.clone();
+        let ec = ak_entry.clone();
+        let sc = ak_status.clone();
+        let st = state.clone();
         ak_write.connect_clicked(move |_| {
-            let key = entry_c.text().to_string();
+            let key = ec.text().to_string();
             let key = key.trim().to_string();
             if key.is_empty() { return; }
             set_api_key_all(&key);
-            reload_keys_in_config(&state2);
-            entry_c.set_text("");
-            status_c.set_text("API KEY 已对接");
-            status_c.remove_css_class("apikey-status-missing");
-            status_c.add_css_class("apikey-status-ok");
+            reload_keys_in_config(&st);
+            ec.set_text("");
+            sc.set_text("API KEY 已对接");
+            sc.remove_css_class("apikey-status-missing");
+            sc.add_css_class("apikey-status-ok");
         });
     }
 
     // Clear API key
     {
-        let status_c = ak_status.clone();
-        let state2   = state.clone();
+        let sc = ak_status.clone();
+        let st = state.clone();
         ak_clear.connect_clicked(move |_| {
             clear_api_key_all();
-            reload_keys_in_config(&state2);
-            status_c.set_text("请输入 API KEY 再对话");
-            status_c.remove_css_class("apikey-status-ok");
-            status_c.add_css_class("apikey-status-missing");
+            reload_keys_in_config(&st);
+            sc.set_text("请输入 API KEY 再对话");
+            sc.remove_css_class("apikey-status-ok");
+            sc.add_css_class("apikey-status-missing");
         });
     }
 
@@ -1519,7 +1897,7 @@ fn build_ui(app: &Application) {
             let res = state2.borrow().session_store.create_session("sensenova-flash-lite", None);
             if let Ok(s) = res {
                 state2.borrow_mut().current_sid = Some(s.id.clone());
-                load_session_messages(&ctx2, &s, &state2.borrow().session_store);
+                load_session_messages(&ctx2, &s, &state2.borrow().session_store, &state2);
                 ctx2.sess_title.set_text(s.title.as_deref().unwrap_or("新会话"));
                 refresh_session_list(&sl, &state2, &ctx2);
                 sr.set_reveal_child(false);
@@ -1528,7 +1906,7 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Session list row activated
+    // Session row activated
     {
         let sr     = sidebar_rev.clone();
         let d      = dim.clone();
@@ -1537,14 +1915,11 @@ fn build_ui(app: &Application) {
         session_list.connect_row_activated(move |_, row| {
             let sid = row.widget_name().to_string();
             if sid.is_empty() { return; }
-            let session = {
-                let st = state2.borrow();
-                st.session_store.get_session(&sid).ok().flatten()
-            };
+            let session = state2.borrow().session_store.get_session(&sid).ok().flatten();
             if let Some(s) = session {
                 state2.borrow_mut().current_sid = Some(s.id.clone());
                 ctx2.sess_title.set_text(s.title.as_deref().unwrap_or("无标题"));
-                load_session_messages(&ctx2, &s, &state2.borrow().session_store);
+                load_session_messages(&ctx2, &s, &state2.borrow().session_store, &state2);
                 sr.set_reveal_child(false);
                 d.set_visible(false);
             }
@@ -1553,26 +1928,22 @@ fn build_ui(app: &Application) {
 
     // Send button
     {
-        let ib    = input_buf.clone();
-        let sl    = session_list.clone();
-        let ar    = attach_rev.clone();
-        let ab    = attach_bar.clone();
-        let sb    = send_btn.clone();
-        let d4    = dsv4f_btn.clone();
-        let th    = think_btn.clone();
+        let ib     = input_buf.clone();
+        let ar     = attach_rev.clone();
+        let ab     = attach_bar.clone();
+        let d4     = dsv4f_btn.clone();
+        let th     = think_btn.clone();
         let state2 = state.clone();
         let ctx2   = panel_ctx.clone();
         send_btn.connect_clicked(move |_| {
             do_send(
-                &state2, &ib, &sl, &ar, &ab, &sb,
+                &state2, &ib, &ar, &ab,
                 d4.is_active(), th.is_active(), &ctx2,
             );
         });
     }
 
-    // Initial session list
     refresh_session_list(&session_list, &state, &panel_ctx);
-
     win.present();
 }
 

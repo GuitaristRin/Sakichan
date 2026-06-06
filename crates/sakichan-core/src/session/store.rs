@@ -479,6 +479,63 @@ impl SessionStore {
 
     /// Get messages filtered to a specific branch chain.
     /// Walk from depth 0 upward, using the active order at each depth.
+    /// Like `get_branch_messages` but also returns the `(depth, order)` of each message.
+    pub fn get_branch_messages_with_coords(
+        &self,
+        session_id: &str,
+        active_depth: i64,
+        active_order: i64,
+    ) -> Result<Vec<(Message, i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT role, content, reasoning_content, tool_calls, tool_call_id, depth, message_order
+             FROM messages WHERE session_id = ?1 AND depth <= ?2
+             ORDER BY depth ASC, message_order ASC, created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, active_depth], |row| {
+            let tool_calls_str: Option<String> = row.get(3)?;
+            let tool_calls = tool_calls_str
+                .and_then(|s| serde_json::from_str::<Vec<crate::models::ToolCall>>(&s).ok());
+            Ok((
+                Message {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                    reasoning_content: row.get(2)?,
+                    tool_calls,
+                    tool_call_id: row.get(4)?,
+                    name: None,
+                    images: Vec::new(),
+                },
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut filtered = Vec::new();
+        for row in rows {
+            let (msg, d, o) = row?;
+            if d < active_depth {
+                filtered.push((msg, d, o));
+            } else if d == active_depth && o == active_order {
+                filtered.push((msg, d, o));
+            }
+        }
+        Ok(filtered)
+    }
+
+    /// Return the distinct `message_order` values at a given depth.
+    pub fn get_orders_at_depth(&self, session_id: &str, depth: i64) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT message_order FROM messages
+             WHERE session_id = ?1 AND depth = ?2
+             ORDER BY message_order ASC",
+        )?;
+        let result: std::result::Result<Vec<i64>, rusqlite::Error> = stmt
+            .query_map(params![session_id, depth], |row| row.get(0))?
+            .collect();
+        Ok(result?)
+    }
+
     pub fn get_branch_messages(&self, session_id: &str, active_depth: i64, active_order: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         // Collect all (depth, order) pairs along the active path
