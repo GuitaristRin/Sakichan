@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/sakichan-core",
+    "crates/sakichan-cli",
+]
+resolver = "2"
