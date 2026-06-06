@@ -2,5 +2,6 @@
 members = [
     "crates/sakichan-core",
     "crates/sakichan-cli",
+    "crates/sakichan-gtk",
 ]
 resolver = "2"
