@@ -2,7 +2,47 @@
    Sakichan — Metro Design · Dark Green Theme
    ============================================================ */
 
-* { border-radius: 0; }
+/* ── Global resets ──────────────────────────────────── */
+
+window {
+    border-radius: 0;
+    font-size: 20px;
+}
+window.csd {
+    background-color: #0d0d0d;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+/* CSD titlebar area — style it dark to match theme */
+.titlebar {
+    background-color: #141414;
+    border: none;
+    box-shadow: none;
+}
+.titlebar button.titlebutton {
+    background-color: transparent;
+    border: none;
+    color: #888;
+    min-width: 34px;
+    min-height: 30px;
+}
+.titlebar button.titlebutton:hover {
+    background-color: rgba(255,255,255,.07);
+    color: #fff;
+}
+.titlebar button.titlebutton.close-button:hover {
+    background-color: #b03030;
+    color: #fff;
+}
+
+button,
+entry,
+scrolledwindow,
+viewport,
+scrollbar {
+    border-radius: 0;
+}
 
 window.main-window {
     background-color: #0d0d0d;
@@ -22,7 +62,6 @@ window.main-window {
     background: none;
     border: none;
     color: #aaa;
-    font-size: 17px;
     padding: 0 14px;
     min-width: 48px;
     min-height: 48px;
@@ -32,7 +71,6 @@ window.main-window {
 .hamburger-btn:active { background-color: rgba(255,255,255,.12); }
 
 .session-title {
-    font-size: 14px;
     color: #bbb;
     font-weight: 400;
 }
@@ -46,7 +84,6 @@ window.main-window {
 }
 
 .apikey-status-ok {
-    font-size: 11px;
     font-weight: 700;
     color: #3a9e60;
     letter-spacing: 0.5px;
@@ -54,7 +91,6 @@ window.main-window {
 }
 
 .apikey-status-missing {
-    font-size: 11px;
     font-weight: 700;
     color: #9a7020;
     letter-spacing: 0.5px;
@@ -64,7 +100,6 @@ window.main-window {
 entry.apikey-entry {
     background-color: #111;
     color: #ccc;
-    font-size: 12px;
     min-height: 28px;
     border: 1px solid #2a2a2a;
     box-shadow: none;
@@ -76,7 +111,6 @@ entry.apikey-entry > text { background-color: transparent; color: #ccc; }
     background-color: #1c4a31;
     border: none;
     color: #c8eed8;
-    font-size: 12px;
     font-weight: 500;
     padding: 4px 10px;
     min-height: 26px;
@@ -89,7 +123,6 @@ entry.apikey-entry > text { background-color: transparent; color: #ccc; }
     background-color: #161616;
     border: 1px solid #2a2a2a;
     color: #666;
-    font-size: 12px;
     padding: 4px 10px;
     min-height: 26px;
     transition: all 100ms linear;
@@ -111,7 +144,6 @@ entry.apikey-entry > text { background-color: transparent; color: #ccc; }
     border-bottom: 1px solid #1e1e1e;
 }
 .sidebar-header label {
-    font-size: 10px;
     font-weight: 700;
     color: #555;
     letter-spacing: 1.8px;
@@ -124,7 +156,6 @@ entry.apikey-entry > text { background-color: transparent; color: #ccc; }
     background-color: #1c4a31;
     border: none;
     color: #c8eed8;
-    font-size: 13px;
     font-weight: 500;
     transition: background-color 100ms linear;
 }
@@ -140,8 +171,8 @@ entry.apikey-entry > text { background-color: transparent; color: #ccc; }
     padding: 11px 16px;
     border-bottom: 1px solid #1a1a1a;
 }
-.session-row-title { font-size: 13px; color: #ccc; }
-.session-row-time  { font-size: 11px; color: #505050; margin-top: 2px; }
+.session-row-title { color: #ccc; }
+.session-row-time  { color: #505050; margin-top: 2px; }
 
 /* ── Chat area ───────────────────────────────────────── */
 
@@ -155,14 +186,13 @@ scrolledwindow.chat-scroll > viewport {
     padding: 20px 28px 12px;
 }
 
-.welcome-label { color: #3a3a3a; font-size: 14px; }
 
 /* Message wrappers */
 .msg-wrapper-user      { margin: 5px 0; }
 .msg-wrapper-assistant { margin: 5px 0; }
 
 .msg-role {
-    font-size: 10px;
+    font-size: 14px;
     font-weight: 700;
     letter-spacing: 1.2px;
     color: #444;
@@ -185,7 +215,6 @@ scrolledwindow.chat-scroll > viewport {
 }
 
 .message-text {
-    font-size: 14px;
     color: #ddd;
     line-height: 1.65;
 }
@@ -199,7 +228,6 @@ scrolledwindow.chat-scroll > viewport {
     margin-right: 18%;
 }
 .thinking-header {
-    font-size: 10px;
     font-weight: 700;
     color: #2a6040;
     letter-spacing: 1px;
@@ -207,7 +235,7 @@ scrolledwindow.chat-scroll > viewport {
     margin-bottom: 4px;
 }
 .thinking-text {
-    font-size: 12px;
+    font-size: 16px;
     color: #567060;
     line-height: 1.55;
     font-style: italic;
@@ -227,14 +255,13 @@ scrolledwindow.chat-scroll > viewport {
     border: 1px solid #253d2c;
     padding: 3px 6px 3px 10px;
 }
-.attach-chip label { font-size: 12px; color: #7aaa8a; }
+.attach-chip label { color: #7aaa8a; }
 
 .attach-remove-btn {
     background: none;
     border: none;
     padding: 0 4px;
     color: #4a6050;
-    font-size: 13px;
     min-width: 20px;
     min-height: 20px;
 }
@@ -256,7 +283,6 @@ scrolledwindow.input-scroll > viewport {
 .input-text {
     background-color: transparent;
     color: #ddd;
-    font-size: 14px;
     caret-color: #3d8a5a;
     border: none;
     box-shadow: none;
@@ -271,7 +297,6 @@ scrolledwindow.input-scroll > viewport {
     background-color: #161616;
     border: 1px solid #2a2a2a;
     color: #555;
-    font-size: 12px;
     font-weight: 500;
     padding: 5px 11px;
     min-height: 28px;
@@ -285,7 +310,6 @@ scrolledwindow.input-scroll > viewport {
     background-color: #161616;
     border: 1px solid #2a2a2a;
     color: #555;
-    font-size: 12px;
     padding: 5px 11px;
     min-height: 28px;
     transition: all 100ms linear;
@@ -296,7 +320,6 @@ scrolledwindow.input-scroll > viewport {
     background-color: #1c5035;
     border: none;
     color: #c8ecd8;
-    font-size: 13px;
     font-weight: 600;
     padding: 5px 20px;
     min-height: 28px;
@@ -322,7 +345,7 @@ scrolledwindow.input-scroll > viewport {
 }
 
 .code-lang {
-    font-size: 10px;
+    font-size: 15px;
     font-weight: 700;
     color: #2e6040;
     letter-spacing: 1px;
@@ -333,7 +356,6 @@ scrolledwindow.input-scroll > viewport {
     background-color: transparent;
     border: 1px solid #2a3a2e;
     color: #4a7a5a;
-    font-size: 11px;
     padding: 2px 8px;
     min-height: 22px;
     transition: all 80ms linear;
@@ -344,9 +366,9 @@ scrolledwindow.input-scroll > viewport {
 textview.code-view,
 textview.code-view > text {
     background-color: #0a0a0a;
+    font-size: 16px;
     color: #b8d4c0;
     font-family: "JetBrains Mono", "Cascadia Code", "Fira Code", monospace;
-    font-size: 13px;
 }
 
 /* ── Context menu popover ────────────────────────────── */
@@ -366,7 +388,6 @@ popover.context-menu-pop > contents {
     background-color: transparent;
     border: none;
     color: #bbb;
-    font-size: 13px;
     padding: 7px 14px;
     min-width: 160px;
     text-align: left;
@@ -392,7 +413,6 @@ spinner.loading-spinner {
 }
 
 .loading-label {
-    font-size: 13px;
     color: #2e7a4e;
     font-style: italic;
     margin-left: 8px;
@@ -403,8 +423,8 @@ spinner.loading-spinner {
 .think-toggle-btn {
     background: none;
     border: none;
+    font-size: 15px;
     color: #2e6040;
-    font-size: 11px;
     font-weight: 700;
     letter-spacing: 0.5px;
     padding: 4px 0;
@@ -433,7 +453,6 @@ spinner.loading-spinner {
     background: none;
     border: 1px solid #253d2c;
     color: #3a7a55;
-    font-size: 13px;
     font-weight: 500;
     min-width: 28px;
     min-height: 24px;
@@ -445,7 +464,6 @@ spinner.loading-spinner {
 .branch-nav-btn:disabled { color: #253d2c; border-color: #1a2e1e; }
 
 .branch-nav-label {
-    font-size: 11px;
     color: #3a6a50;
     margin: 0 6px;
     letter-spacing: 0.5px;
@@ -457,7 +475,6 @@ textview.edit-input,
 textview.edit-input > text {
     background-color: #0f1a14;
     color: #ddd;
-    font-size: 14px;
     caret-color: #3d8a5a;
     border: 1px solid #2e5a3e;
     padding: 6px 10px;
@@ -467,7 +484,6 @@ textview.edit-input > text {
     background-color: #1c5035;
     border: none;
     color: #c8ecd8;
-    font-size: 12px;
     font-weight: 600;
     padding: 4px 14px;
     min-height: 26px;
@@ -480,7 +496,6 @@ textview.edit-input > text {
     background-color: #161616;
     border: 1px solid #2a2a2a;
     color: #666;
-    font-size: 12px;
     padding: 4px 14px;
     min-height: 26px;
     transition: all 100ms linear;
@@ -502,3 +517,60 @@ scrollbar slider {
 }
 scrollbar slider:hover { background-color: #333; }
 scrollbar.vertical slider { min-width: 4px; }
+
+/* ── Widget internal overrides (Windows compat) ────── */
+
+/* Text widget internals */
+textview > text {
+    background-color: transparent;
+    color: #ddd;
+}
+textview > text > selection {
+    background-color: #1c5035;
+    color: #fff;
+}
+
+/* Entry widget internals */
+entry > text {
+    background-color: transparent;
+    color: #ccc;
+}
+
+/* ScrolledWindow viewport — force dark */
+scrolledwindow > viewport {
+    background-color: transparent;
+}
+scrolledwindow > viewport > * {
+    background-color: transparent;
+}
+
+/* Scrollbar trough — often light on Windows */
+scrollbar {
+    background-color: transparent;
+    border: none;
+}
+scrollbar trough {
+    background-color: #181818;
+    border: none;
+}
+
+/* Popover background */
+popover > contents {
+    background-color: #111;
+    border: 1px solid #2a2a2a;
+    padding: 4px;
+}
+
+/* ListBox row states */
+list > row {
+    background-color: transparent;
+}
+list > row:selected {
+    background-color: rgba(30,90,55,.35);
+}
+
+/* Selection color fallback */
+selection {
+    background-color: #1c5035;
+    color: #fff;
+}

@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -1543,6 +1545,11 @@ fn build_ui(app: &Application) {
         STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
+    // Force dark theme variant (especially important on Windows)
+    if let Some(s) = gtk4::Settings::default() {
+        s.set_gtk_application_prefer_dark_theme(true);
+    }
+
     let state: State = match AppState::init() {
         Ok(s)  => Rc::new(RefCell::new(s)),
         Err(e) => { eprintln!("init error: {e}"); return; }
@@ -1951,7 +1958,25 @@ fn build_ui(app: &Application) {
 // Entry point
 // ─────────────────────────────────────────
 
+fn setup_portable_env() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let dir = dir.to_string_lossy().to_string();
+            // DLLs 和 exe 放同目录即可被 Windows 自动找到
+            // 以下环境变量让 GTK4 能找到运行时数据
+            unsafe {
+                std::env::set_var("GTK_DATA_PREFIX", &dir);
+                std::env::set_var("GTK_EXE_PREFIX", &dir);
+                std::env::set_var("XDG_DATA_DIRS", format!("{dir}\\share"));
+                std::env::set_var("GDK_PIXBUF_MODULE_FILE", format!("{dir}\\lib\\gdk-pixbuf-2.0\\2.10.0\\loaders.cache"));
+                std::env::set_var("FONTCONFIG_PATH", format!("{dir}\\etc\\fonts"));
+            }
+        }
+    }
+}
+
 fn main() {
+    setup_portable_env();
     let _ = rt();
     let app = Application::builder()
         .application_id("com.sakichan.gtk")

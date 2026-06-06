@@ -15,7 +15,10 @@ Thumbs.db
 # Config files (user-specific)
 config.toml
 
-# Logs
+# Distribution packages
+Sakichan-Windows/
+Sakichan-Desktop/
+Sakichan-Desktop.zip
 *.log
 
 # Rust
