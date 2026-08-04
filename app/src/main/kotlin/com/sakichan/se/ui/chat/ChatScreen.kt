@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -38,6 +39,7 @@ import io.github.takahashirinta.kanesumi.controls.MetroDivider
 import io.github.takahashirinta.kanesumi.controls.MetroDrawer
 import io.github.takahashirinta.kanesumi.controls.MetroIconButton
 import io.github.takahashirinta.kanesumi.controls.MetroProgressIndicator
+import io.github.takahashirinta.kanesumi.core.insets.bottomOverlayPadding
 import io.github.takahashirinta.kanesumi.core.theme.LocalMetroColors
 import io.github.takahashirinta.kanesumi.core.theme.LocalMetroTypography
 import io.github.takahashirinta.kanesumi.core.theme.MetroIcon
@@ -58,15 +60,21 @@ fun ChatScreen(
     onCloseDrawer: () -> Unit,
     onOpenSession: (String) -> Unit,
     onNewSession: () -> Unit,
+    onDeleteSession: (String) -> Unit,
 ) {
     val colors = LocalMetroColors.current
     val listState = rememberLazyListState()
 
-    // 新消息时自动滚到底
+    // 新消息时自动滚到底;若用户正往上翻历史,不抢滚动
     LaunchedEffect(state.items.size) {
         if (state.items.isNotEmpty()) {
-            delay(60)
-            listState.animateScrollToItem(state.items.size - 1)
+            delay(80)
+            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            val total = listState.layoutInfo.totalItemsCount
+            val nearBottom = lastVisible >= total - 2
+            if (nearBottom) {
+                listState.animateScrollToItem(state.items.size - 1)
+            }
         }
     }
 
@@ -86,14 +94,17 @@ fun ChatScreen(
                         enabled = !state.isLoading,
                         sendIcon = Icons.AutoMirrored.Filled.Send,
                         sendContentDescription = "发送",
+                        modifier = Modifier.imePadding(),
                     )
                 }
             },
         ) {
             LazyColumn(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .imePadding(),
                 state = listState,
-                contentPadding = PaddingValues(bottom = 16.dp),
+                contentPadding = PaddingValues(bottom = bottomOverlayPadding().calculateBottomPadding() + 16.dp),
             ) {
                 item {
                     MetroAppBar(
@@ -143,6 +154,7 @@ fun ChatScreen(
                 onDismiss = onCloseDrawer,
                 onOpenSession = onOpenSession,
                 onNewSession = onNewSession,
+                onDeleteSession = onDeleteSession,
             )
         }
     }
@@ -352,6 +364,7 @@ private fun SessionTreeDrawer(
     onDismiss: () -> Unit,
     onOpenSession: (String) -> Unit,
     onNewSession: () -> Unit,
+    onDeleteSession: (String) -> Unit,
 ) {
     val colors = LocalMetroColors.current
     val typography = LocalMetroTypography.current
@@ -359,27 +372,31 @@ private fun SessionTreeDrawer(
 
     MetroDrawer(onDismiss = onDismiss) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // 机器节点 = 标题
-            MetroText(
-                text = tree?.machine?.name ?: "Sakichan",
-                color = colors.onSurface,
-                style = typography.pageHeading.copy(fontSize = 24.sp),
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp),
-            )
-            tree?.machine?.let {
+            // 顶栏:App 名 + 当前机器
+            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp)) {
                 MetroText(
-                    text = "${it.host}:${it.port}",
-                    color = colors.onSurfaceVariant,
-                    style = typography.caption,
-                    modifier = Modifier.padding(horizontal = 16.dp),
+                    text = "Sakichan",
+                    color = colors.onSurface,
+                    style = typography.pageHeading,
                 )
+                tree?.machine?.let {
+                    MetroText(
+                        text = "${it.name} · ${it.host}:${it.port}",
+                        color = colors.onSurfaceVariant,
+                        style = typography.caption,
+                        modifier = Modifier.padding(top = 2.dp),
+                        maxLines = 1,
+                    )
+                }
             }
 
-            MetroDivider(modifier = Modifier.padding(vertical = 12.dp))
+            MetroDivider()
 
+            // 新建 session:整块按钮,直角底色区分
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .background(colors.surfaceVariant)
                     .clickable(onClick = onNewSession)
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -391,7 +408,7 @@ private fun SessionTreeDrawer(
                     sizeDp = 20.dp,
                 )
                 Spacer(Modifier.width(8.dp))
-                MetroText(text = "新建 session", color = colors.onSurface, style = typography.body)
+                MetroText(text = "新建 session", color = colors.onSurface, style = typography.bodyMedium)
             }
 
             MetroDivider()
@@ -407,7 +424,7 @@ private fun SessionTreeDrawer(
             val projects = tree?.projects.orEmpty()
             if (projects.isEmpty() && !state.treeLoading) {
                 MetroText(
-                    text = "暂无项目",
+                    text = "暂无项目 / session",
                     color = colors.onSurfaceVariant,
                     style = typography.caption,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -418,17 +435,21 @@ private fun SessionTreeDrawer(
                 projects.forEach { project ->
                     item(key = "p-${project.project.id}") {
                         ProjectHeader(
-                            name = project.project.name ?: project.project.worktree ?: project.project.id,
+                            name = project.project.name ?: project.project.worktree?.substringAfterLast('/')
+                                ?: project.project.id,
                             path = project.project.worktree,
+                            sessionCount = project.sessions.size,
                         )
                     }
                     project.sessions.forEach { session ->
                         item(key = session.id) {
                             SessionRow(
                                 sessionId = session.id,
-                                title = session.title ?: session.id.take(8),
+                                title = session.title
+                                    ?: "session · ${session.id.takeLast(6)}",
                                 active = state.sessionId == session.id,
                                 onClick = { onOpenSession(session.id) },
+                                onDelete = { onDeleteSession(session.id) },
                             )
                         }
                     }
@@ -449,24 +470,32 @@ private fun SessionTreeDrawer(
 }
 
 @Composable
-private fun ProjectHeader(name: String, path: String?) {
+private fun ProjectHeader(name: String, path: String?, sessionCount: Int) {
     val colors = LocalMetroColors.current
     val typography = LocalMetroTypography.current
-    Column(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .background(colors.surfaceVariant)
-            .padding(horizontal = 16.dp, vertical = 8.dp),
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        MetroText(text = name, color = colors.onSurface, style = typography.bodyMedium)
-        if (path != null) {
-            MetroText(
-                text = path,
-                color = colors.onSurfaceVariant,
-                style = typography.caption,
-                maxLines = 1,
-            )
+        Column(modifier = Modifier.weight(1f)) {
+            MetroText(text = name, color = colors.onSurface, style = typography.bodyMedium)
+            if (path != null && path != name) {
+                MetroText(
+                    text = path,
+                    color = colors.onSurfaceVariant,
+                    style = typography.caption,
+                    maxLines = 1,
+                )
+            }
         }
+        MetroText(
+            text = "$sessionCount",
+            color = colors.onSurfaceVariant,
+            style = typography.label,
+        )
     }
 }
 
@@ -476,6 +505,7 @@ private fun SessionRow(
     title: String,
     active: Boolean,
     onClick: () -> Unit,
+    onDelete: () -> Unit,
 ) {
     val colors = LocalMetroColors.current
     val typography = LocalMetroTypography.current
@@ -483,7 +513,7 @@ private fun SessionRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(start = 16.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         MetroText(
@@ -496,6 +526,15 @@ private fun SessionRow(
             color = if (active) colors.primary else colors.onSurface,
             style = typography.body,
             maxLines = 1,
+            modifier = Modifier.weight(1f),
         )
+        MetroIconButton(onClick = onDelete) {
+            MetroIcon(
+                imageVector = Icons.Filled.Close,
+                contentDescription = "删除本地缓存",
+                tint = colors.onSurfaceVariant,
+                sizeDp = 16.dp,
+            )
+        }
     }
 }

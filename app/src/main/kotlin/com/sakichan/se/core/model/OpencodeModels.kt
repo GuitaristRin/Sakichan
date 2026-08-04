@@ -1,6 +1,5 @@
 package com.sakichan.se.core.model
 
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -42,22 +41,19 @@ data class OcProject(
     val id: String,
     val name: String? = null,
     val worktree: String? = null,
-    val vcs: OcProjectVcs? = null,
+    val vcs: String? = null,
     val time: OcProjectTime? = null,
 )
 
-@Serializable
-data class OcProjectVcs(
-    val branch: String? = null,
-    @SerialName("default_branch")
-    val defaultBranch: String? = null,
-)
-
+/**
+ * 项目时间戳。按真实 1.18.x schema:created / updated / initialized。
+ * 旧版文档的 modified / accessed 已废弃。
+ */
 @Serializable
 data class OcProjectTime(
     val created: Long? = null,
-    val modified: Long? = null,
-    val accessed: Long? = null,
+    val updated: Long? = null,
+    val initialized: Long? = null,
 )
 
 /**
@@ -90,6 +86,29 @@ data class OcMessageRequest(
     val parts: List<OcTextPartInput>,
     val noReply: Boolean? = null,
     val agent: String? = null,
+)
+
+/** GET /session/:id/message 返回的消息:info + parts。 */
+@Serializable
+data class OcSessionMessage(
+    val info: OcMessageInfo = OcMessageInfo(),
+    val parts: List<OcMessagePart> = emptyList(),
+)
+
+@Serializable
+data class OcMessageInfo(
+    val id: String? = null,
+    val sessionID: String? = null,
+    val role: String? = null,
+)
+
+/** 消息 part:type 为 text / step-start / step-finish / reasoning / tool 等。 */
+@Serializable
+data class OcMessagePart(
+    val id: String? = null,
+    val type: String? = null,
+    val text: String? = null,
+    val callID: String? = null,
 )
 
 /** POST /session/:id/permissions/:permissionID 的请求体。 */
@@ -213,19 +232,21 @@ sealed interface OcEvent {
     ) : OcEvent
 
     companion object {
-        const val TYPE_TEXT_DELTA = "session.next.text.delta"
+        // v1 事件流(/event?directory=)实测类型
+        const val TYPE_TEXT_DELTA = "message.part.delta"
+        const val TYPE_PART_UPDATED = "message.part.updated"
+        const val TYPE_SESSION_STATUS = "session.status"
+        const val TYPE_SESSION_IDLE = "session.idle"
+        const val TYPE_SESSION_ERROR = "session.error"
+        const val TYPE_STEP_FAILED = "session.next.step.failed"
+
+        // 旧文档/备用类型(部分 serve 可能推)
         const val TYPE_REASONING_DELTA = "session.next.reasoning.delta"
         const val TYPE_TOOL_CALLED = "session.next.tool.called"
         const val TYPE_TOOL_SUCCESS = "session.next.tool.success"
         const val TYPE_TOOL_FAILED = "session.next.tool.failed"
         const val TYPE_TOOL_PROGRESS = "session.next.tool.progress"
-        const val TYPE_STEP_STARTED = "session.next.step.started"
-        const val TYPE_STEP_ENDED = "session.next.step.ended"
-        const val TYPE_STEP_FAILED = "session.next.step.failed"
         const val TYPE_PERMISSION_ASKED = "permission.asked"
         const val TYPE_PERMISSION_V2_ASKED = "permission.v2.asked"
-        const val TYPE_SESSION_IDLE = "session.idle"
-        const val TYPE_SESSION_ERROR = "session.error"
-        const val TYPE_MESSAGE_UPDATED = "message.updated"
     }
 }

@@ -70,6 +70,8 @@ private fun AppRoot() {
         Screen.CHAT -> {
             val vm: ChatViewModel = koinViewModel()
             val state by vm.uiState.collectAsStateWithLifecycle()
+            // 进入聊天页时恢复最近 session(仅当未显示过会话)
+            LaunchedEffect(Unit) { vm.restoreLastSession() }
             ChatScreen(
                 state = state,
                 onInputChange = vm::onInputChange,
@@ -84,6 +86,7 @@ private fun AppRoot() {
                 onCloseDrawer = vm::closeDrawer,
                 onOpenSession = vm::openSession,
                 onNewSession = vm::newSession,
+                onDeleteSession = vm::deleteSessionCache,
             )
         }
 

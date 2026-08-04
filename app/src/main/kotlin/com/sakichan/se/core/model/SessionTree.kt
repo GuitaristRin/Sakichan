@@ -61,6 +61,7 @@ suspend fun OpencodeClient.openSessionContext(
         modelId = "deepseek-v4-flash",
         systemPrompt = systemPrompt,
     ).also { ctx ->
+        ctx.title = session.title
         ctx.setDepthOrder(0, 0)
     }
 }

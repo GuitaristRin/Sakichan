@@ -37,11 +37,19 @@ class OpencodeClient(
     }
 
     /** 创建 session。parentID 非空时为 fork(对应 deri 分支)。 */
-    suspend fun createSession(baseUrl: String, req: OcSessionCreateRequest = OcSessionCreateRequest()): OcSession {
+    suspend fun createSession(
+        baseUrl: String,
+        req: OcSessionCreateRequest = OcSessionCreateRequest(),
+        directory: String? = null,
+    ): OcSession {
         val body = json.encodeToString(OcSessionCreateRequest.serializer(), req)
             .toRequestBody(JSON)
+        val url = buildString {
+            append(trimSlash(baseUrl)).append("/session")
+            if (!directory.isNullOrBlank()) append("?directory=").append(urlEncode(directory))
+        }
         val resp = okHttpClient.newCall(
-            Request.Builder().url("${trimSlash(baseUrl)}/session").post(body).build()
+            Request.Builder().url(url).post(body).build()
         ).await()
         return json.decodeFromString(OcSession.serializer(), resp.body!!.string())
     }
@@ -62,6 +70,20 @@ class OpencodeClient(
             Request.Builder().url("${trimSlash(baseUrl)}/session/$id").get().build()
         ).await()
         return json.decodeFromString(OcSession.serializer(), resp.body!!.string())
+    }
+
+    /**
+     * 轮询会话消息。此版本的事件流(per-session SSE)实测为空流,
+     * 任务完成信号改用轮询 message:等 assistant 出现 step-finish part。
+     */
+    suspend fun listMessages(baseUrl: String, sessionId: String): List<OcSessionMessage> {
+        val resp = okHttpClient.newCall(
+            Request.Builder().url("${trimSlash(baseUrl)}/session/$sessionId/message").get().build()
+        ).await()
+        return json.decodeFromString(
+            kotlinx.serialization.builtins.ListSerializer(OcSessionMessage.serializer()),
+            resp.body!!.string(),
+        )
     }
 
     /** 列出该机器上所有项目(工作目录)。连接后用于构建「机器->项目->session」树。 */
@@ -135,14 +157,19 @@ class OpencodeClient(
     }
 
     /**
-     * 订阅 session 事件流(SSE)。这是核心:实时拿 token 输出 / 工具调用 / 权限请求。
-     * 端点 `/api/session/:id/event`,首事件后持续推送,直到 [session.idle] 或出错。
+     * 订阅 session 事件流(SSE)。实测真实端点(v1)是 `GET /event?directory=<工作目录>`,
+     * 不是 `/api/session/:id/event`(后者在 1.18.11 上是空流)。
      *
-     * 防御性解析:服务端事件可能为 `{id,type,properties}` 或扁平 `{type,...}`,
-     * 统一归一为 [OcEvent]。取消订阅即取消 EventSource。
+     * 事件 payload 在 `properties` 字段,核心事件:
+     * - `message.part.delta`  流式文本增量(delta)
+     * - `message.part.updated` part 完整快照
+     * - `session.idle` / `session.error`  完成 / 出错
+     * - `permission.asked`(本 serve 上未推送,权限走 `/api/permission/request` 轮询)
+     *
+     * 取消订阅即取消 EventSource。收到 idle/error 后关闭流。
      */
-    fun events(baseUrl: String, sessionId: String): Flow<OcEvent> = callbackFlow {
-        val url = "${trimSlash(baseUrl)}/api/session/$sessionId/event"
+    fun events(baseUrl: String, sessionId: String, directory: String): Flow<OcEvent> = callbackFlow {
+        val url = "${trimSlash(baseUrl)}/event?directory=${urlEncode(directory)}"
         val request = Request.Builder().url(url).get().build()
         val factory = EventSources.createFactory(okHttpClient)
 
@@ -151,6 +178,8 @@ class OpencodeClient(
                 if (data.isBlank()) return
                 try {
                     val parsed = parseEvent(data, type)
+                    // /event 是按目录的全局流,可能混入同目录其他 session 的事件
+                    if (parsed.sessionID != null && parsed.sessionID != sessionId) return
                     trySend(parsed)
                     if (parsed is OcEvent.SessionIdle || parsed is OcEvent.SessionError) {
                         channel.close()
@@ -164,11 +193,13 @@ class OpencodeClient(
                 if (!channel.isClosedForSend) {
                     val msg = when {
                         t != null -> "SSE error: ${t.message}"
-                        response != null -> "SSE HTTP ${response.code}"
+                        response != null -> "SSE HTTP ${response.code}${response.body?.string()?.take(200)?.let { ": $it" } ?: ""}"
                         else -> "SSE unknown error"
                     }
                     trySend(OcEvent.SessionError(sessionId, msg))
                 }
+                // 必须关流:否则 collect 永不结束,executeOpencodeTask 卡死
+                channel.close()
             }
 
             override fun onClosed(source: EventSource) {
@@ -181,9 +212,12 @@ class OpencodeClient(
     }
 
     /**
-     * 归一化解析单条 SSE data。
-     * - 若 JSON 含 `type` 字段:用其值判定事件类型,payload 在 `properties` 或顶层。
-     * - 否则用 SSE 的 `event:` 头(type 形参)。
+     * 归一化解析单条 SSE data(v1 `/event?directory=` 流)。
+     *
+     * 事件结构 `{id, type, properties: {...}}`,payload 在 `properties`:
+     * - `message.part.delta`   delta 增量(field=text/reasoning)
+     * - `message.part.updated` part 快照,按 part.type 分派(step-start/step-finish/text/tool)
+     * - `session.idle` / `session.error` / `session.status`
      */
     private fun parseEvent(data: String, sseType: String?): OcEvent {
         val obj = json.parseToJsonElement(data).jsonObject
@@ -193,76 +227,19 @@ class OpencodeClient(
         val sid = props.str("sessionID") ?: obj.str("sessionID")
 
         return when (type) {
-            OcEvent.TYPE_TEXT_DELTA -> OcEvent.TextDelta(
-                sessionID = sid,
-                messageID = props.str("assistantMessageID"),
-                textID = props.str("textID"),
-                delta = props.str("delta") ?: "",
-            )
+            OcEvent.TYPE_TEXT_DELTA -> {
+                val field = props.str("field")
+                val delta = props.str("delta") ?: ""
+                if (field == "reasoning") {
+                    OcEvent.ReasoningDelta(sid, props.str("messageID"), props.str("partID"), delta)
+                } else {
+                    OcEvent.TextDelta(sid, props.str("messageID"), props.str("partID"), delta)
+                }
+            }
 
-            OcEvent.TYPE_REASONING_DELTA -> OcEvent.ReasoningDelta(
-                sessionID = sid,
-                messageID = props.str("assistantMessageID"),
-                reasoningID = props.str("reasoningID"),
-                delta = props.str("delta") ?: "",
-            )
+            OcEvent.TYPE_PART_UPDATED -> parsePartUpdated(sid, props)
 
-            OcEvent.TYPE_TOOL_CALLED -> OcEvent.ToolCalled(
-                sessionID = sid,
-                messageID = props.str("assistantMessageID"),
-                callID = props.str("callID"),
-                tool = props.str("tool") ?: "tool",
-                input = props["input"],
-            )
-
-            OcEvent.TYPE_TOOL_SUCCESS -> OcEvent.ToolSuccess(
-                sessionID = sid,
-                messageID = props.str("assistantMessageID"),
-                callID = props.str("callID"),
-                output = props.str("output"),
-            )
-
-            OcEvent.TYPE_TOOL_FAILED, OcEvent.TYPE_STEP_FAILED -> OcEvent.ToolFailed(
-                sessionID = sid,
-                messageID = props.str("assistantMessageID"),
-                callID = props.str("callID"),
-                error = props["error"]?.let { err ->
-                    when (err) {
-                        is JsonObject -> err.str("message") ?: err.toString()
-                        else -> err.strOrNull() ?: err.toString()
-                    }
-                } ?: type,
-            )
-
-            OcEvent.TYPE_TOOL_PROGRESS -> OcEvent.Other(sid, type, obj)
-
-            OcEvent.TYPE_STEP_STARTED -> OcEvent.StepStarted(
-                sessionID = sid,
-                messageID = props.str("assistantMessageID"),
-                agent = props.str("agent"),
-            )
-
-            OcEvent.TYPE_STEP_ENDED -> OcEvent.StepEnded(
-                sessionID = sid,
-                messageID = props.str("assistantMessageID"),
-                reason = props.str("reason"),
-            )
-
-            OcEvent.TYPE_PERMISSION_ASKED -> OcEvent.PermissionAsked(
-                sessionID = sid,
-                requestID = props.str("id") ?: "",
-                permission = props.str("permission") ?: "unknown",
-                patterns = props["patterns"]?.jsonArray?.strList() ?: emptyList(),
-                tool = props["tool"]?.let { json.decodeFromJsonElement(OcPermissionToolRef.serializer(), it) },
-            )
-
-            OcEvent.TYPE_PERMISSION_V2_ASKED -> OcEvent.PermissionAsked(
-                sessionID = sid,
-                requestID = props.str("id") ?: "",
-                permission = props.str("action") ?: "unknown",
-                patterns = props["resources"]?.jsonArray?.strList() ?: emptyList(),
-                tool = null,
-            )
+            OcEvent.TYPE_SESSION_STATUS -> OcEvent.Other(sid, type, obj)
 
             OcEvent.TYPE_SESSION_IDLE -> OcEvent.SessionIdle(sid)
 
@@ -276,7 +253,60 @@ class OpencodeClient(
                 } ?: "session error",
             )
 
+            OcEvent.TYPE_PERMISSION_ASKED -> OcEvent.PermissionAsked(
+                sessionID = sid,
+                requestID = props.str("id") ?: props.str("requestID") ?: "",
+                permission = props.str("permission") ?: "unknown",
+                patterns = props["patterns"]?.jsonArray?.strList() ?: emptyList(),
+                tool = props["tool"]?.let { json.decodeFromJsonElement(OcPermissionToolRef.serializer(), it) },
+            )
+
+            OcEvent.TYPE_PERMISSION_V2_ASKED -> OcEvent.PermissionAsked(
+                sessionID = sid,
+                requestID = props.str("id") ?: "",
+                permission = props.str("action") ?: "unknown",
+                patterns = props["resources"]?.jsonArray?.strList() ?: emptyList(),
+                tool = null,
+            )
+
+            // 旧文档备用类型:兜底映射
+            OcEvent.TYPE_REASONING_DELTA -> OcEvent.ReasoningDelta(
+                sid, props.str("assistantMessageID"), props.str("reasoningID"), props.str("delta") ?: "",
+            )
+            OcEvent.TYPE_TOOL_CALLED -> OcEvent.ToolCalled(
+                sid, props.str("assistantMessageID"), props.str("callID"), props.str("tool") ?: "tool", props["input"],
+            )
+            OcEvent.TYPE_TOOL_SUCCESS -> OcEvent.ToolSuccess(
+                sid, props.str("assistantMessageID"), props.str("callID"), props.str("output"),
+            )
+            OcEvent.TYPE_TOOL_FAILED, OcEvent.TYPE_STEP_FAILED -> OcEvent.ToolFailed(
+                sid, props.str("assistantMessageID"), props.str("callID"),
+                props["error"]?.let { err ->
+                    when (err) {
+                        is JsonObject -> err.str("message") ?: err.toString()
+                        else -> err.strOrNull() ?: err.toString()
+                    }
+                } ?: type,
+            )
+            OcEvent.TYPE_TOOL_PROGRESS -> OcEvent.Other(sid, type, obj)
+
             else -> OcEvent.Other(sid, type, obj)
+        }
+    }
+
+    /** message.part.updated:按 part.type 分派。 */
+    private fun parsePartUpdated(sid: String?, props: JsonObject): OcEvent {
+        val part = props["part"]?.jsonObject
+        val partType = part?.str("type")
+        val messageID = part?.str("messageID") ?: props.str("messageID")
+        return when (partType) {
+            "step-start" -> OcEvent.StepStarted(sid, messageID, part?.str("agent"))
+            "step-finish" -> OcEvent.StepEnded(sid, messageID, part?.str("reason") ?: part?.str("reasoning"))
+            "text" -> OcEvent.TextDelta(sid, messageID, part?.str("id"), part?.str("text") ?: "")
+            "reasoning" -> OcEvent.ReasoningDelta(sid, messageID, part?.str("id"), part?.str("text") ?: "")
+            "tool" -> OcEvent.ToolCalled(sid, messageID, part?.str("callID"), part?.str("name") ?: "tool", part)
+            "error" -> OcEvent.ToolFailed(sid, messageID, part?.str("callID"), part?.str("text") ?: "tool error")
+            else -> OcEvent.Other(sid, "message.part.updated", props)
         }
     }
 
@@ -287,6 +317,10 @@ class OpencodeClient(
         private val EMPTY = "".toRequestBody(JSON)
     }
 }
+
+/** URL 编码单个查询参数值(路径里的目录可能含空格等)。 */
+private fun urlEncode(value: String): String =
+    java.net.URLEncoder.encode(value, "UTF-8")
 
 /** OkHttp Call 同步执行 -> suspend。非 2xx 抛 [SakichanError.Api]。 */
 suspend fun Call.await(): Response {

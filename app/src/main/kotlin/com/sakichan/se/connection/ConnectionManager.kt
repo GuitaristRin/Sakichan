@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.asStateFlow
 data class ConnectionState(
     val activeMachine: Machine? = null,
     val projects: List<OcProject> = emptyList(),
+    val currentDirectory: String? = null,
     val connecting: Boolean = false,
     val error: String? = null,
 )
@@ -28,16 +29,21 @@ class ConnectionManager {
     val activeMachine: Machine? get() = _state.value.activeMachine
     val activeBaseUrl: String? get() = _state.value.activeMachine?.baseUrl
 
+    /** 当前机器的活跃工作目录(建 session / 订阅 /event 流用)。 */
+    val activeDirectory: String? get() = _state.value.currentDirectory
+
     /** 标记正在连接(健康检查 + 拉项目列表进行中)。 */
     fun setConnecting() {
         _state.value = _state.value.copy(connecting = true, error = null)
     }
 
-    /** 连接成功:记录机器 + 其项目列表。 */
-    fun connect(machine: Machine, projects: List<OcProject>) {
+    /** 连接成功:记录机器 + 其项目列表 + 当前工作目录。 */
+    fun connect(machine: Machine, projects: List<OcProject>, currentDirectory: String? = null) {
         _state.value = ConnectionState(
             activeMachine = machine.copy(reachable = true),
             projects = projects,
+            currentDirectory = currentDirectory
+                ?: projects.firstOrNull { !it.worktree.isNullOrBlank() && it.worktree != "/" }?.worktree,
             connecting = false,
             error = null,
         )

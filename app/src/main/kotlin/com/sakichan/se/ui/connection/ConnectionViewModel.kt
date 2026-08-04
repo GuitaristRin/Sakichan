@@ -72,8 +72,11 @@ class ConnectionViewModel(
             try {
                 val health = opencode.health(machine.baseUrl)
                 val projects = opencode.listProjects(machine.baseUrl)
+                val directory = runCatching { opencode.currentProject(machine.baseUrl).worktree }.getOrNull()
+                    ?.takeIf { !it.isNullOrBlank() && it != "/" }
+                    ?: projects.firstOrNull { !it.worktree.isNullOrBlank() && it.worktree != "/" }?.worktree
                 val resolved = machine.copy(version = health.version)
-                connection.connect(resolved, projects)
+                connection.connect(resolved, projects, directory)
                 _uiState.update { it.copy(connecting = false) }
             } catch (e: Exception) {
                 val msg = "连接失败: ${e.message ?: e.javaClass.simpleName}"

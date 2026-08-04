@@ -38,23 +38,51 @@ PC 端启动:`opencode serve --hostname 0.0.0.0 --port 4096 --mdns`
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `POST` | `/session` | 创建 session,body `{parentID?, title?, agent?}` |
+| `POST` | `/session` | 创建 session,body `{parentID?, title?, agent?}`,query `directory?`(**必带**,避开失效项目) |
 | `GET` | `/session` | 列出所有 session |
 | `GET` | `/session/:id` | 获取 session 详情 |
-| `GET` | `/session/:id/message` | 列出 session 消息 |
+| `GET` | `/session/:id/message` | **轮询消息列表——任务完成检测靠它(step-finish part)** |
 | `POST` | `/session/:id/prompt_async` | **异步发消息**(204),配合事件流拿实时性 |
 | `POST` | `/session/:id/permissions/:permissionID` | 权限回调,body `{response: "once"\|"always"\|"reject"}` |
 | `POST` | `/session/:id/fork` | 分叉,body `{messageID?}` |
 | `POST` | `/session/:id/abort` | 中止 |
-| `GET` | `/api/session/:id/event` | **per-session SSE 事件流**(核心) |
+| `GET` | **`/event?directory=<工作目录>`** | **真正的 per-directory SSE 事件流**(v1) |
+| `GET` | `/api/event`、`/global/event` | 全局事件流(v2,payload 在 `data`/`payload` 字段) |
+| `GET` | `/api/session/:id/permission` | 权限轮询(实测常空) |
 | `GET` | `/global/health` | 探活 + 版本 |
 | `GET` | `/project` / `/project/current` | 项目列表 / 当前项目(工作目录) |
 | `GET` | `/file/content`、`/find` | 只读文件(Phase 3) |
 
-**事件流(`/api/session/:id/event`)是核心**:app 订阅 SSE,实时拿 token 输出
-(`session.next.text.delta`)、思考块(`session.next.reasoning.delta`)、工具调用
-(`session.next.tool.called/success/failed`)、权限请求(`permission.asked`)、
-空闲/错误(`session.idle`/`session.error`)。
+> **Schema 实测修正(2026-08-04)**:`Project.vcs` 是**字符串**枚举(`"git"`),不是对象;
+> `Project.time` 字段为 `created/updated/initialized`(旧文档 `modified/accessed` 已废弃)。
+> 此前按旧文档把 `vcs` 声明成对象导致连接页 `listProjects` 抛 `unexpected json token`,
+> 已改 `OpencodeModels.kt` 对齐真实 1.18.x spec。
+
+### 3.1 事件流实测(与旧文档不符,以此为准)
+
+BUILD.md 旧版写的是 `GET /api/session/:id/event` + `session.next.text.delta` 事件,
+**实测 1.18.11 完全不推**(per-session 端点是空流)。真正可用的:
+
+- **`GET /event?directory=<工作目录>`**(v1):目录级事件流,payload 在 `properties` 字段。
+  核心事件:
+  - `message.part.delta` → 流式文本增量,`properties.delta`(field=text/reasoning)
+  - `message.part.updated` → part 快照,按 `properties.part.type` 分派
+    (step-start / step-finish / text / reasoning / tool / error)
+  - `session.idle` / `session.error` → 完成 / 出错
+  - `session.status` → busy 等
+- **完成信号**:事件流收不到 idle 时,app 用**轮询 `/session/:id/message`** 兜底,
+  检测 assistant 消息含 `step-finish` part 即任务完成,180s 超时。
+- **权限**:实测 `permission.asked` 事件不推、`/api/session/:id/permission` 轮询常空。
+  手机上 approve/deny 仍走 `POST /session/:id/permissions/:permissionID`,
+  但触发时机待 serve 行为稳定后再对齐。
+- **建 session 必带 `directory` query**:serve 的项目注册表可能残留失效目录(如项目迁移前
+  的旧路径),不带 directory 时新 session 落到死目录,agent 一跑就 ENOENT(SSE 500)。
+   现 app 在连接时取 `/project/current` 或首个有效项目的 worktree 作为目录传入。
+
+**任务执行链路(app 实测可用)**:`prompt_async` 发指令 → 订阅 `/event?directory=` 拿
+`message.part.delta` 流式增量 → **轮询 `/session/:id/message` 兜底**,等 assistant 出现
+`step-finish` part 即完成 → 拼输出回灌秘书总结。旧文档的 per-session SSE 端点
+(`/api/session/:id/event`)与 `session.next.*` 事件在 1.18.11 实测不推送。
 
 ## 4. 秘书 ↔ App 协议:function calling(已拍板)
 
@@ -88,7 +116,7 @@ PC 端启动:`opencode serve --hostname 0.0.0.0 --port 4096 --mdns`
 | DI | Koin 4.0.2 | `koin-compose` + `koin-compose-viewmodel`(非旧 `koin-androidx-compose`) |
 | 序列化 | kotlinx-serialization **1.6.3** | ⚠️ 不能用 1.7.3:要求 Kotlin 2.0+,本项目锁 1.9.24 |
 | 设置存储 | SharedPreferences + EncryptedSharedPreferences | API key 加密存储 |
-| 持久化 | (待定)Room 或 DataStore | 聊天历史、session 缓存(Phase 2) |
+| 持久化 | **DataStore Preferences + kotlinx JSON** | 聊天历史 + session 元数据缓存(`ChatHistoryRepository`) |
 | 发现 | Android `NsdManager` | 扫描 `_http._tcp`,过滤 `opencode-*`(bonjour name) |
 | compileSdk / minSdk | 36 / 26 | |
 
@@ -132,6 +160,24 @@ Sakichan 不再有本地副本,直接 import `io.github.takahashirinta.kanesumi.
 - 动画:用 `:kanesumi-anim` 的 Sokuou 预设,不散写 `tween(300, ...)`
 - 默认即 Metro:`MetroTheme` 注入 `LocalIndication = MetroIndication`,所有 `.clickable {}` 免费获得直角闪切
 
+### 6.4 本地持久化(Phase 2)
+
+聊天历史与 session 元数据缓存,**DataStore Preferences + kotlinx JSON**,
+而非 Room:数据量小、序列化与现有 kotlinx-serialization 栈一致,无需 KSP。
+
+- `PersistedChat.kt`:可序列化模型。`PersistedChatSession`(sessionId/projectID/title/
+  lastActiveAt/messages/items)+ `PersistedSessionMeta`(抽屉离线索引)+ `PersistedChatItem`
+  (展示层 User/Secretary,任务与错误行是瞬时状态不缓存)
+- `ChatHistoryRepository`:key `chat_<machineId>_<sessionId>` 存会话,**每机器一份索引**
+  key `sessions_<machineId>`。`saveChat` / `updateIndex` / `loadChat` / `listSessions` /
+  `deleteChat` 全部防御性解析(损坏即返回 null / 空)
+- `ChatViewModel` 编排:
+  - 每轮秘书回复 / 任务完成 / 总结轮后 `saveCurrentSession()`,断开连接时也存
+  - `openSession()` 优先从本地缓存恢复历史(服务器不可达也回退缓存,不报错)
+  - 重连后 `restoreLastSession()` 自动回到最近活跃的 session
+  - `refreshSessionTree()` 成功后缓存元数据;服务器不可达时用缓存重建抽屉树
+  - 抽屉每行加删除按钮,`deleteSessionCache()` 只清本地、不动服务器
+
 ## 7. 模块结构(当前实际)
 
 ```
@@ -158,6 +204,7 @@ Sakichan/
 │       │   │   │   ├── Models.kt         # ChatOptions / FinalResult / Session
 │       │   │   │   ├── Events.kt         # StreamEvent / PipelineEvent
 │       │   │   │   ├── OpencodeModels.kt # opencode API 模型 + Machine + OcEvent
+│       │   │   │   ├── PersistedChat.kt  # 本地持久化模型(聊天历史 + session 元数据)
 │       │   │   │   └── SessionTree.kt    # 机器-项目-session 树 + buildSessionTree()
 │       │   │   ├── session/SessionContext.kt
 │       │   │   └── util/                 # CjkUtils / Utils
@@ -165,7 +212,7 @@ Sakichan/
 │       │   │   ├── discovery/DiscoveryService.kt  # NsdManager 扫描
 │       │   │   ├── network/ChatApiClient.kt       # LLM 流式 + tool_calls 归并
 │       │   │   ├── network/OpencodeClient.kt      # opencode HTTP + SSE
-│       │   │   └── repository/AppConfigRepository.kt + SecretaryPrompt.kt
+│       │   │   └── repository/AppConfigRepository.kt + SecretaryPrompt.kt + ChatHistoryRepository.kt
 │       │   ├── di/AppModule.kt           # Koin 模块
 │       │   └── ui/
 │       │       ├── theme/SakichanTheme.kt
@@ -202,7 +249,7 @@ Sakichan/
 - ✅ **session 树抽屉**(机器-项目-session)
 
 ### Phase 2 — 对话管理
-- [ ] **本地持久化** — Room 或 DataStore,缓存聊天历史 + session 元数据
+- [x] **本地持久化** — DataStore Preferences + kotlinx JSON 缓存聊天历史 + session 元数据
 - [ ] **deri fork UI** — 对话树可视化,基于 opencode session fork(客户端 API 已就绪)
 - [ ] 自动生成 session 标题(opencode `/session/:id` PATCH title)
 
@@ -257,3 +304,13 @@ https://mirrors.cloud.tencent.com/gradle/gradle-9.3.1-bin.zip
 - `legacy/` 已删:开发时无旧代码参考,需要时从 git 历史 `9fa31e1~1` 取
 - mDNS 联调需 PC 带 `--mdns`;不带则手机手动输 IP
 - 调试包 applicationId 带 `.debug` 后缀(`com.sakichan.se.debug`)
+- **双 opencode 现象**:app 连接页出现多个"opencode"选项 = PC 上有多个 `opencode serve
+  --mdns` 实例在广播。交互式 `opencode`(TUI)虽也起本地 server,但只绑 localhost,手机
+  连不上;手机只能连 `serve --hostname 0.0.0.0 --mdns`。只想留一台就杀掉多余 serve。
+- **失效项目目录**:`opencode serve` 启动后,项目注册表会记录当时 cwd;若目录后来被
+  删除/迁移(如本仓库从 `~/Desktop/Sakichan` 迁到 `~/projects/Sakichan`),残留条目会让
+  新建 session 落到死目录,agent 报 ENOENT。app 已通过建 session 时传 `directory` 规避;
+  PC 侧彻底清理可删对应项目记录或重启 serve。
+- **键盘**:输入栏/列表已加 `imePadding()`(edge-to-edge 下必须手动消费 IME insets,
+  `adjustResize` 在 API 30+ 不自动生效),聊天列表底部留 `bottomOverlayPadding()` 防输入
+  栏遮挡。

@@ -21,6 +21,7 @@ class SessionContext(
 
     private val messages: LinkedList<Message> = LinkedList()
     private var hasMemoryInjection = false
+    var title: String? = null
     var currentDepth: Long = 0
         private set
     var currentOrder: Long = 0
