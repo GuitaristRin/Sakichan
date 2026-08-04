@@ -1,5 +1,7 @@
 # BUILD.md — Sakichan SE 构建指南
 
+> 维护于 2026-08-04,项目已迁移至 `/home/rain/projects/Sakichan`。
+
 ## 1. 项目定位
 
 Sakichan SE 是 **opencode 编码 agent 的秘书前端**(原生 Android 应用)。
@@ -14,62 +16,67 @@ Sakichan SE 是 **opencode 编码 agent 的秘书前端**(原生 Android 应用)
 └─────────────┘    流式回复+SSE   └──────────────┘   事件流+SSE     └──────────────────┘
 ```
 
+**App 启动流程**:连接页 mDNS 扫描附近 opencode 机器 → 选机器连接(健康检查+拉项目
+列表)→ 聊天页。多机器各管各的,session 组织成「机器 → 项目目录 → session」树。
+
 ## 2. 核心角色
 
 | 角色 | 模型 / 引擎 | 端点 | 用途 |
 |---|---|---|---|
-| 秘书主脑 | DeepSeek V4 Flash (`deepseek-v4-flash`) | SenseNova token 端点 `https://token.sensenova.cn/v1/chat/completions` | 理解用户意图、生成结构化指令、总结 opencode 输出。`reasoning_effort:"medium"`,`reasoning_content` 思考块需保留展示 |
-| 图像理解 | SenseNova Flash-Lite (`sensenova-6.7-flash-lite`) | 同上 | 两阶段管线:先让 Flash-Lite 描述图片,再把描述喂给 DeepSeek(DeepSeek 不支持多模态) |
-| 图像生成 | SenseNova U1-Fast | 桌面 config 有端点,旧 mobile 未实现 | 秘书可调用生成图片(后续) |
+| 秘书主脑 | DeepSeek V4 Flash (`deepseek-v4-flash`) | SenseNova token 端点 `https://token.sensenova.cn/v1/chat/completions` | 理解用户意图、function calling 派活、总结 opencode 输出。`reasoning_effort:"medium"`,`reasoning_content` 思考块需保留展示 |
+| 图像理解 | SenseNova Flash-Lite (`sensenova-6.7-flash-lite`) | 同上 | (Phase 3)两阶段管线:先让 Flash-Lite 描述图片,再把描述喂给 DeepSeek(DeepSeek 不支持多模态) |
+| 图像生成 | SenseNova U1-Fast | 桌面 config 有端点 | (Phase 3)秘书可调用生成图片 |
 | 编码执行 | opencode (headless) | 局域网 `http://<PC-IP>:4096` | 实际编码 agent,接收指令、执行文件操作、返回 diff |
+| 权限批准 | 用户(手机上) | — | opencode 请求改文件/跑命令时,手机弹 approve / deny / always |
 
-## 3. opencode Server API
+## 3. opencode Server API(已按真实 schema 实现)
 
 PC 端启动:`opencode serve --hostname 0.0.0.0 --port 4096 --mdns`
 
-关键端点(OpenAPI 3.1):
+> ⚠️ 以下端点对照 **opencode 1.18.x 的 OpenAPI 3.1 spec**(`GET /doc` 抓取),
+> 与本文档早期版本不同。已实现于 `OpencodeClient.kt`,改动 schema 时以此为准。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `POST` | `/session` | 创建 session |
+| `POST` | `/session` | 创建 session,body `{parentID?, title?, agent?}` |
 | `GET` | `/session` | 列出所有 session |
 | `GET` | `/session/:id` | 获取 session 详情 |
-| `POST` | `/session/:id/message` | 向 session 发消息(触发 agent 执行) |
-| `GET` | `/session/:id/event` | SSE 事件流(token 输出、工具调用、权限请求等) |
-| `POST` | `/session/:id/permissions/:id` | 权限确认回调(approve/deny) |
-| `POST` | `/session/:id/fork?messageID=` | 从某消息分叉(deri 换思路) |
-| `GET` | `/file/content` | 只读获取文件内容 |
-| `GET` | `/find` | 只读文件搜索 |
+| `GET` | `/session/:id/message` | 列出 session 消息 |
+| `POST` | `/session/:id/prompt_async` | **异步发消息**(204),配合事件流拿实时性 |
+| `POST` | `/session/:id/permissions/:permissionID` | 权限回调,body `{response: "once"\|"always"\|"reject"}` |
+| `POST` | `/session/:id/fork` | 分叉,body `{messageID?}` |
+| `POST` | `/session/:id/abort` | 中止 |
+| `GET` | `/api/session/:id/event` | **per-session SSE 事件流**(核心) |
+| `GET` | `/global/health` | 探活 + 版本 |
+| `GET` | `/project` / `/project/current` | 项目列表 / 当前项目(工作目录) |
+| `GET` | `/file/content`、`/find` | 只读文件(Phase 3) |
 
-事件流(`/event`)是核心:app 订阅 SSE,实时展示 agent 的 token 输出、工具调用进度、
-权限请求(需用户在手机上 approve/deny)。
+**事件流(`/api/session/:id/event`)是核心**:app 订阅 SSE,实时拿 token 输出
+(`session.next.text.delta`)、思考块(`session.next.reasoning.delta`)、工具调用
+(`session.next.tool.called/success/failed`)、权限请求(`permission.asked`)、
+空闲/错误(`session.idle`/`session.error`)。
 
-## 4. 标记语法(秘书 ↔ App 协议)
+## 4. 秘书 ↔ App 协议:function calling(已拍板)
 
-秘书 LLM 的回复中嵌入标记,App 解析后驱动 UI 状态机:
+早期设想的 `[#task]`/`[#done]` 文本标记**已废弃**。改用 function calling(决策 #3):
 
-| 标记 | 形态 | 语义 |
-|---|---|---|
-| `[#task]` | 单行或 `[#task]...[/#task]` 围栏 | 开始一个 opencode 任务 |
-| `[#confirm id]` | 单行 | 请求用户确认(对应 opencode 权限回调) |
-| `[#reject id]` | 单行 | 用户拒绝(传回 opencode) |
-| `[#done]` | 单行 | 任务完成 |
-| `[#ask]` | 单行 | 秘书需要用户补充信息 |
+- 秘书 system prompt 见 `SecretaryPrompt.kt`
+- 工具:`run_opencode_task`,参数 `{instruction: string}`
+- 秘书调工具 → `ChatViewModel` 拦截 → 建/复用 session → `prompt_async` 发指令 →
+  订阅事件流 → 权限回调 → `session.idle` 后把输出拼成 tool result 回灌秘书做总结
+- 总结轮不带 tools,强制输出文本(防无限派活)
 
-**标记生成机制(待拍板)**:两个方向 --
-1. **function calling**:让 DeepSeek 输出结构化 JSON,App 序列化为标记 -- 可靠但需 schema 设计
-2. **prompt 围栏块**:在 system prompt 中教秘书产出标记文本 -- 灵活但可能不稳定
+## 5. Session 树(deri 映射)
 
-当前推荐方向 1(function calling),先跑通再优化。
+用户确认的架构:**「机器 id → 项目目录名 → session id」**。多机器分属不同管理,构成
+树状目录。
 
-## 5. deri — 对话树
+- 机器:经 mDNS 扫描或手动输入,`Machine(id, baseUrl, name, host, port)`
+- 项目:opencode `/project` 返回,`OcProject(id, worktree=目录, name, vcs)`
+- session:opencode `/session`,按 `projectID` 归类到项目
+- 抽屉 UI:`SessionTreeDrawer`(MetroDrawer),机器名标题 → 项目目录(可折叠)→ sessions
 
-旧 Sakichan 的 `(depth, order)` 对话树概念:用户可以从某条历史消息"换思路"分叉,
-产生新的 order,同一 depth 下多个 order 形成树。
-
-**新版映射**:opencode server 原生支持 `POST /session/:id/fork?messageID=`,
-deri 树直接映射到 session fork。每次 fork 生成新 session,parentID/messageID 留痕,
-UI 可以展示树形结构并切换分支。落地深度待定(MVP 可先只做线性,后续加 fork UI)。
+旧 Sakichan 的 `(depth, order)` 对话树已由 opencode session fork(`POST /fork`)覆盖。
 
 ## 6. 技术栈
 
@@ -77,11 +84,12 @@ UI 可以展示树形结构并切换分支。落地深度待定(MVP 可先只做
 |---|---|---|
 | UI | **Kanesumi**(Metro 风格) | 经 `includeBuild("../Kanesumi")` 组合构建接入。主题色注入 Sakichan 墨绿 `#1C5035` |
 | 语言 | Kotlin 1.9.24 | 对齐 Kanesumi 工具链(AGP 8.5.0 / Compose BOM 2024.12.01 / Compose compiler 1.5.14) |
-| 网络 | OkHttp 4.12 + okhttp-sse | SSE 解析(复用 legacy `ChatApiClient`) |
-| DI | Koin 4.0 | 轻量,无 ksp 依赖 |
-| 序列化 | kotlinx-serialization 1.7.3 | LLM API JSON + opencode API JSON |
-| 设置存储 | DataStore Preferences + EncryptedSharedPreferences | API key 加密存储,server URL 普通存储 |
-| 持久化 | (待定)Room 或 DataStore | 聊天历史、session 缓存。旧 Room schema 需重构(适配 opencode session 模型) |
+| 网络 | OkHttp 4.12 + okhttp-sse | SSE 解析(复用 legacy `ChatApiClient` + 新增 `OpencodeClient`) |
+| DI | Koin 4.0.2 | `koin-compose` + `koin-compose-viewmodel`(非旧 `koin-androidx-compose`) |
+| 序列化 | kotlinx-serialization **1.6.3** | ⚠️ 不能用 1.7.3:要求 Kotlin 2.0+,本项目锁 1.9.24 |
+| 设置存储 | SharedPreferences + EncryptedSharedPreferences | API key 加密存储 |
+| 持久化 | (待定)Room 或 DataStore | 聊天历史、session 缓存(Phase 2) |
+| 发现 | Android `NsdManager` | 扫描 `_http._tcp`,过滤 `opencode-*`(bonjour name) |
 | compileSdk / minSdk | 36 / 26 | |
 
 ### 6.1 Kanesumi 组合构建
@@ -98,19 +106,22 @@ includeBuild("../Kanesumi") {
 }
 ```
 
+Sakichan 与 Kanesumi 是兄弟目录(`/home/rain/projects/` 下),`../Kanesumi` 直接命中。
 App 模块只需声明 `implementation("io.github.takahashirinta:kanesumi-structure")`,
-structure 经 `api` 传递 controls/anim/core,下游一键触达全部组件。
-Kanesumi 发布 Maven Central 后,删掉 `includeBuild` 块即可切换到远程依赖。
+structure 经 `api` 传递 controls/anim/core。Kanesumi 发布 Maven Central 后删 `includeBuild` 即可。
 
-### 6.2 Kanesumi 缺失组件(需新建,有通用价值)
+### 6.2 贡献回 Kanesumi 的组件(已完成)
 
-| 组件 | 用途 | 优先级 |
+Sakichan 实战自建、**已贡献回 Kanesumi** `kanesumi-controls`(commit f2e3f0b):
+
+| 组件 | 用途 | 状态 |
 |---|---|---|
-| `MetroDrawer` | 汉堡抽屉(左侧滑出,session 列表) | 高 |
-| `MetroTextField` | 文本输入框(Metro 直角无圆角) | 高 |
-| `MetroChatInputBar` | 底部输入栏(挂 MetroBottomStack,自适应键盘) | 高 |
+| `MetroDrawer` | 汉堡抽屉(左侧滑出,session 列表) | ✅ 已在 Kanesumi |
+| `MetroTextField` | 文本输入框(Metro 直角无圆角) | ✅ 已在 Kanesumi |
+| `MetroChatInputBar` | 底部输入栏(挂 MetroBottomStack,自适应键盘) | ✅ 已在 Kanesumi,`sendIcon` 参数化(controls 零 M3 铁律) |
 
-这三个组件将在 Sakichan 实战中开发,完成后贡献回 Kanesumi 库。
+Sakichan 不再有本地副本,直接 import `io.github.takahashirinta.kanesumi.controls.*`。
+**改这些组件的公共 API 时,注意另一个消费者 Ncrust。**
 
 ### 6.3 Metro 外观约束
 
@@ -121,130 +132,94 @@ Kanesumi 发布 Maven Central 后,删掉 `includeBuild` 块即可切换到远程
 - 动画:用 `:kanesumi-anim` 的 Sokuou 预设,不散写 `tween(300, ...)`
 - 默认即 Metro:`MetroTheme` 注入 `LocalIndication = MetroIndication`,所有 `.clickable {}` 免费获得直角闪切
 
-## 7. 模块结构
+## 7. 模块结构(当前实际)
 
 ```
 Sakichan/
-├── settings.gradle.kts          # includeBuild Kanesumi + dependencySubstitution
+├── settings.gradle.kts          # includeBuild ../Kanesumi + dependencySubstitution
 ├── build.gradle.kts
 ├── gradle/
-│   ├── libs.versions.toml       # 版本目录(对齐 Kanesumi + app 专用)
+│   ├── libs.versions.toml       # 版本目录(kotlinx-serialization = 1.6.3)
 │   └── wrapper/                 # gradle 9.3.1
 ├── app/
 │   ├── build.gradle.kts
 │   ├── proguard-rules.pro
 │   └── src/main/
-│       ├── AndroidManifest.xml  # usesCleartextTraffic=true(连局域网 HTTP)
+│       ├── AndroidManifest.xml  # usesCleartextTraffic=true + mDNS 权限
 │       ├── kotlin/com/sakichan/se/
-│       │   ├── SakichanApp.kt           # Application(待接 Koin)
-│       │   ├── MainActivity.kt          # Compose 入口,SakichanTheme + MetroShell
+│       │   ├── SakichanApp.kt           # Koin 启动
+│       │   ├── MainActivity.kt          # 连接状态驱动导航:CONNECTION ↔ CHAT ↔ SETTINGS
+│       │   ├── connection/
+│       │   │   └── ConnectionManager.kt # 活跃机器状态(StateFlow),驱动顶层导航
 │       │   ├── core/
 │       │   │   ├── error/SakichanError.kt
-│       │   │   ├── model/Events.kt             # StreamEvent / PipelineEvent
-│       │   │   ├── model/Message.kt            # LLM 消息模型 + JSON 序列化
-│       │   │   ├── model/Models.kt             # ChatOptions / FinalResult / Session 等
-│       │   │   ├── session/SessionContext.kt   # 滑动窗口截断 + deri 分支
-│       │   │   └── util/
-│       │   │       ├── CjkUtils.kt             # CJK 关键词提取(记忆检索)
-│       │   │       └── Utils.kt                # TokenEstimator / Base64Utils
+│       │   │   ├── model/
+│       │   │   │   ├── Message.kt        # LLM 消息模型 + tool_calls
+│       │   │   │   ├── Models.kt         # ChatOptions / FinalResult / Session
+│       │   │   │   ├── Events.kt         # StreamEvent / PipelineEvent
+│       │   │   │   ├── OpencodeModels.kt # opencode API 模型 + Machine + OcEvent
+│       │   │   │   └── SessionTree.kt    # 机器-项目-session 树 + buildSessionTree()
+│       │   │   ├── session/SessionContext.kt
+│       │   │   └── util/                 # CjkUtils / Utils
 │       │   ├── data/
-│       │   │   ├── network/ChatApiClient.kt    # OkHttp SSE 流式聊天
-│       │   │   ├── network/OpencodeClient.kt   # (待建)opencode server API 客户端
-│       │   │   └── repository/AppConfigRepository.kt  # API key + 模型配置
+│       │   │   ├── discovery/DiscoveryService.kt  # NsdManager 扫描
+│       │   │   ├── network/ChatApiClient.kt       # LLM 流式 + tool_calls 归并
+│       │   │   ├── network/OpencodeClient.kt      # opencode HTTP + SSE
+│       │   │   └── repository/AppConfigRepository.kt + SecretaryPrompt.kt
+│       │   ├── di/AppModule.kt           # Koin 模块
 │       │   └── ui/
-│       │       ├── theme/SakichanTheme.kt      # MetroTheme 封装,注入墨绿 primary
-│       │       ├── chat/ChatScreen.kt          # (待建)聊天主界面
-│       │       ├── chat/ChatViewModel.kt       # (待建)
-│       │       └── settings/SettingsScreen.kt  # (待建)
+│       │       ├── theme/SakichanTheme.kt
+│       │       ├── connection/ConnectionScreen.kt + ConnectionViewModel.kt
+│       │       ├── chat/ChatScreen.kt + ChatViewModel.kt + ChatUiState.kt
+│       │       └── settings/SettingsScreen.kt + SettingsHost.kt
 │       └── res/
-│           ├── drawable/                        # launcher 图标
-│           ├── mipmap-anydpi-v26/               # adaptive icon
-│           ├── values/{strings,colors,themes}.xml
-│           └── values-zh/strings.xml
+│           ├── drawable/ + mipmap-anydpi-v26/     # launcher 图标
+│           └── values/{strings,colors,themes}.xml
 ├── assets/icons/                # 原始图标备份
-└── legacy/                      # (gitignored)旧桌面端 Rust + 旧 mobile,仅本地参考
+└── README.md                    # 樱花标项目主页
 ```
 
-## 8. 已迁移的有效物(legacy → 新项目)
+## 8. 迁移历史(legacy 已删除)
 
-| 文件 | 来源(legacy/mobile) | 改动 |
-|---|---|---|
-| `SakichanError.kt` | `core/error/SakichanError.kt` | 包名 `mobile` → `se` |
-| `Events.kt` | `core/model/Events.kt` | 包名 |
-| `Message.kt` | `core/model/Message.kt` | 包名 |
-| `Models.kt` | `core/model/Models.kt` | 包名 |
-| `SessionContext.kt` | `core/session/SessionContext.kt` | 包名 |
-| `CjkUtils.kt` | `core/util/CjkUtils.kt` | 包名 |
-| `Utils.kt` | `core/util/Utils.kt` | 包名 |
-| `ChatApiClient.kt` | `data/network/ChatApiClient.kt` | 包名 |
-| `AppConfigRepository.kt` | `data/repository/AppConfigRepository.kt` | 包名 |
-| launcher 图标 | `res/drawable/` + `res/mipmap-anydpi-v26/` | 直接复制 |
-| `colors.xml` | `res/values/colors.xml` | 直接复制(保留备用) |
-| `themes.xml` | `res/values/themes.xml` | 简化:纯黑背景,去掉旧绿 |
+旧桌面端(Rust GTK)+ 旧 mobile(Kotlin M3)曾移入 `legacy/` 作参考,**已于 2026-08-04
+删除**(227MB,gitignored 从未跟踪,纯本地干扰 Android Studio)。旧 Rust checkout
+`/home/rain/projects/Sakichan` 也已删除,其历史全在 git 中。
 
-### 未迁移(需重构)
+已迁移进新项目的有效物(改包名 `mobile` → `se`):`SakichanError` / `Events` /
+`Message` / `Models` / `SessionContext` / `CjkUtils` / `Utils` / `ChatApiClient` /
+`AppConfigRepository` / launcher 图标 / `colors.xml` / `themes.xml`。
 
-| 文件 | 原因 |
-|---|---|
-| `ChatRepository.kt` | 架构变更:旧版直连 LLM,新版需加 opencode server 调度层 |
-| `Repositories.kt` (SessionRepository/MemoryRepository) | 依赖 Room DAO,Room schema 需按 opencode session 模型重构 |
-| `Daos.kt` / `MessageDao.kt` / `SessionDao.kt` | 同上 |
-| `Entities.kt` | 同上 |
-| `SakichanDatabase.kt` | 同上 |
-| `Modules.kt` (Koin DI) | 需重写,适配新架构 |
-| `ChatScreen.kt` / `ChatViewModel.kt` | M3 UI 全部废弃,用 Kanesumi Metro 重写 |
-| `SettingsScreen.kt` | 同上 |
-| `MarkdownParser.kt` / `MarkdownRenderer.kt` | 需评估是否保留(可能用 Kanesumi 组件替代) |
-| `Color.kt` / `Theme.kt` / `Type.kt` | M3 主题全部废弃,用 `SakichanTheme`(MetroTheme 封装)替代 |
+## 9. 路线图(当前进度)
 
-## 9. 待建路线图
-
-### Phase 1 — 最小闭环(MVP)
-
-目标:用户在手机上发消息,秘书调用 opencode server 执行,结果流式回传。
-
-1. **`OpencodeClient`** — opencode server HTTP API 客户端
-   - 创建 session、发消息、订阅 SSE 事件流
-   - 权限回调(approve/deny)
-   - JSON 模型对应 OpenAPI 3.1 schema
-2. **秘书 prompt 工程** — system prompt 教秘书:
-   - 理解用户编码意图
-   - 产出 `[#task]` 标记 + opencode 指令
-   - 监听 opencode 事件流,总结后回传用户
-3. **`ChatViewModel`** — 编排层:
-   - 用户消息 → 秘书 LLM
-   - 秘书标记 → opencode server
-   - opencode SSE → 秘书总结 → 用户
-4. **`ChatScreen`** — Metro 聊天界面:
-   - 消息列表(LazyColumn,MetroAppBar 作首项)
-   - 底部输入栏(`MetroChatInputBar`,挂 `MetroBottomStack`)
-   - 秘书思考块(`reasoning_content` 折叠展示)
-   - 任务状态标记(`[#task]`/`[#done]` 视觉反馈)
-5. **`MetroTextField` + `MetroChatInputBar`** — Kanesumi 新组件
-6. **`SettingsScreen`** — 基础设置:
-   - SenseNova API key(加密存储)
-   - opencode server URL(如 `http://192.168.1.100:4096`)
+### Phase 1 — 最小闭环 ✅ 已完成
+- ✅ `OpencodeClient`(session/prompt_async/SSE/权限/fork/health/projects)
+- ✅ 秘书 prompt 工程 + function calling(`SecretaryPrompt.kt`)
+- ✅ `ChatViewModel` 编排层(用户→秘书→opencode→总结→用户)
+- ✅ `ChatScreen`(Metro 聊天 + 任务状态 + 权限条 + 思考块)
+- ✅ `MetroTextField` / `MetroChatInputBar`(已贡献 Kanesumi)
+- ✅ `SettingsScreen`(API key 加密 + 模型 ID)
+- ✅ **启动连接页**(mDNS 扫描 + 手动输入 + 多机器)
+- ✅ **session 树抽屉**(机器-项目-session)
 
 ### Phase 2 — 对话管理
-
-7. **`MetroDrawer`** — 左侧汉堡抽屉,session 列表
-8. **本地持久化** — Room 或 DataStore,缓存聊天历史 + session 元数据
-9. **deri fork UI** — 对话树可视化,基于 opencode session fork
+- [ ] **本地持久化** — Room 或 DataStore,缓存聊天历史 + session 元数据
+- [ ] **deri fork UI** — 对话树可视化,基于 opencode session fork(客户端 API 已就绪)
+- [ ] 自动生成 session 标题(opencode `/session/:id` PATCH title)
 
 ### Phase 3 — 增强
+- [ ] 多模态 — 两阶段图片管线(Flash-Lite 分析 → DeepSeek 回答)
+- [ ] 图像生成 — SenseNova U1-Fast
+- [ ] 文件浏览 — opencode 只读 API(`/file/content`、`/find`)
+- [ ] 权限通知 — opencode 权限请求推送通知
 
-10. **多模态** — 两阶段图片管线(Flash-Lite 分析 → DeepSeek 回答)
-11. **图像生成** — SenseNova U1-Fast 集成
-12. **文件浏览** — opencode 只读 API(`/file/content`、`/find`)
-13. **权限通知** — opencode 权限请求推送通知
+## 10. 架构决策(已拍板)
 
-## 10. 待拍板的架构决策
-
-| # | 决策点 | 选项 | 当前倾向 |
-|---|---|---|---|
-| 1 | 编排放 PC bridge 还是手机直连 | A: 手机直连 opencode + 秘书 LLM<br>B: PC 上跑 bridge 服务,手机只连 bridge | A(手机直连):减少 PC 端组件,opencode server 本身就是 HTTP |
-| 2 | MVP 切多大 | A: 仅秘书对话 + opencode 执行<br>B: 加 session 管理 + deri<br>C: 全功能 | A:先跑通"发消息→执行→回传"闭环 |
-| 3 | 标记生成机制 | A: function calling(JSON)<br>B: prompt 围栏块(文本标记) | A:function calling 更可靠,先跑通 |
+| # | 决策点 | 结论 |
+|---|---|---|
+| 1 | 编排放 PC bridge 还是手机直连 | **手机直连**。opencode server 本身就是 HTTP,无需额外 bridge(已确认不引入 Go 后端) |
+| 2 | MVP 切多大 | 先跑通「发消息→执行→回传」闭环,已扩展出连接页 + session 树 |
+| 3 | 标记生成机制 | **function calling**。`run_opencode_task` 工具,不用文本标记 |
+| 4 | 组件归属 | Metro 组件**贡献回 Kanesumi**,不自成一套 |
 
 ## 11. 构建命令
 
@@ -254,6 +229,8 @@ Sakichan/
 ./gradlew assemble                  # 全量构建
 ```
 
+联调:`opencode serve --hostname 0.0.0.0 --port 4096 --mdns`
+
 ### 网络提示
 
 本机访问 `services.gradle.org` 不稳定。首次构建若 gradle-9.3.1 分发下载超时,
@@ -262,7 +239,6 @@ Sakichan/
 https://mirrors.cloud.tencent.com/gradle/gradle-9.3.1-bin.zip
 → ~/.gradle/wrapper/dists/gradle-9.3.1-bin/<hash>/
 ```
-(Windows: `%USERPROFILE%\.gradle\wrapper\dists\gradle-9.3.1-bin\<hash>\`)
 
 ## 12. 与 Ncrust / Kanesumi / Sokuou 的关系
 
@@ -274,12 +250,10 @@ https://mirrors.cloud.tencent.com/gradle/gradle-9.3.1-bin.zip
 - **Ncrust** — 独立 app 项目(不在本仓库),也是 Kanesumi 的消费者。Sakichan 与 Ncrust
   无直接关系,但共享 Kanesumi 组件层。
 
-## 13. Git 历史
+## 13. 已知注意事项
 
-```
-9fa31e1 chore: 旧桌面端与旧mobile移入legacy作参考,清空root准备秘书版重写
-1c0f29e temp: 整合入原版移动端sakichan准备重塑
-```
-
-旧桌面端(Rust GTK)和旧 mobile(Kotlin M3)已移入 `legacy/`(gitignored),
-仅本地参考。新项目从空白 root 重建,工具链对齐 Kanesumi,UI 全部 Kanesumi Metro。
+- `gradlew` 已加执行权限;AGP 8.5.0 在 JDK 26 下有 Kotlin daemon 警告,可忽略
+  (Kanesumi 用 JDK 21 工具链 `~/.gradle/jdks`)
+- `legacy/` 已删:开发时无旧代码参考,需要时从 git 历史 `9fa31e1~1` 取
+- mDNS 联调需 PC 带 `--mdns`;不带则手机手动输 IP
+- 调试包 applicationId 带 `.debug` 后缀(`com.sakichan.se.debug`)
