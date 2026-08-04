@@ -20,10 +20,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.sakichan.se.core.model.Machine
-import com.sakichan.se.ui.components.MetroTextField
 import io.github.takahashirinta.kanesumi.controls.MetroButton
 import io.github.takahashirinta.kanesumi.controls.MetroIconButton
 import io.github.takahashirinta.kanesumi.controls.MetroProgressIndicator
+import io.github.takahashirinta.kanesumi.controls.MetroTextField
 import io.github.takahashirinta.kanesumi.core.theme.LocalMetroColors
 import io.github.takahashirinta.kanesumi.core.theme.LocalMetroTypography
 import io.github.takahashirinta.kanesumi.core.theme.MetroIcon

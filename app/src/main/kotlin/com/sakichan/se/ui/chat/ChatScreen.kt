@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Check
@@ -32,7 +33,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.takahashirinta.kanesumi.controls.MetroButton
+import io.github.takahashirinta.kanesumi.controls.MetroChatInputBar
 import io.github.takahashirinta.kanesumi.controls.MetroDivider
+import io.github.takahashirinta.kanesumi.controls.MetroDrawer
 import io.github.takahashirinta.kanesumi.controls.MetroIconButton
 import io.github.takahashirinta.kanesumi.controls.MetroProgressIndicator
 import io.github.takahashirinta.kanesumi.core.theme.LocalMetroColors
@@ -41,8 +44,6 @@ import io.github.takahashirinta.kanesumi.core.theme.MetroIcon
 import io.github.takahashirinta.kanesumi.core.theme.MetroText
 import io.github.takahashirinta.kanesumi.structure.MetroAppBar
 import io.github.takahashirinta.kanesumi.structure.MetroShell
-import com.sakichan.se.ui.components.MetroChatInputBar
-import com.sakichan.se.ui.components.MetroDrawer
 import kotlinx.coroutines.delay
 
 @Composable
@@ -83,6 +84,8 @@ fun ChatScreen(
                         onTextChange = onInputChange,
                         onSend = onSend,
                         enabled = !state.isLoading,
+                        sendIcon = Icons.AutoMirrored.Filled.Send,
+                        sendContentDescription = "发送",
                     )
                 }
             },
