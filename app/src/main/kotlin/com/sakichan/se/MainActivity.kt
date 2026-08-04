@@ -80,6 +80,10 @@ private fun AppRoot() {
                     vm.disconnect()
                     connection.disconnect()
                 },
+                onOpenDrawer = vm::openDrawer,
+                onCloseDrawer = vm::closeDrawer,
+                onOpenSession = vm::openSession,
+                onNewSession = vm::newSession,
             )
         }
 

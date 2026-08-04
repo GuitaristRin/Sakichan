@@ -1,6 +1,7 @@
 package com.sakichan.se.ui.chat
 
 import com.sakichan.se.core.model.OcPermissionRequest
+import com.sakichan.se.core.model.SessionTree
 
 /**
  * 聊天界面的一条可见消息。区分来源:用户 / 秘书 / 系统(opencode 反馈)。
@@ -45,4 +46,7 @@ data class ChatUiState(
     val sessionId: String? = null,
     val pendingPermission: PendingPermission? = null,
     val notConfigured: Boolean = false,
+    val drawerOpen: Boolean = false,
+    val sessionTree: SessionTree? = null,
+    val treeLoading: Boolean = false,
 )

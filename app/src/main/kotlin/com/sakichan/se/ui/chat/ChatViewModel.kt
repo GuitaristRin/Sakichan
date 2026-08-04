@@ -276,6 +276,61 @@ class ChatViewModel(
         return session.id
     }
 
+    // ===== 抽屉 / session 树管理 =====
+
+    fun openDrawer() {
+        _uiState.update { it.copy(drawerOpen = true) }
+        refreshSessionTree()
+    }
+
+    fun closeDrawer() {
+        _uiState.update { it.copy(drawerOpen = false) }
+    }
+
+    /** 拉取当前机器的「机器-项目-session」树,供抽屉展示。 */
+    fun refreshSessionTree() {
+        val machine = connection.activeMachine ?: return
+        _uiState.update { it.copy(treeLoading = true) }
+        viewModelScope.launch {
+            runCatching { opencodeClient.buildSessionTree(machine) }
+                .onSuccess { tree -> _uiState.update { it.copy(sessionTree = tree, treeLoading = false) } }
+                .onFailure { e -> _uiState.update { it.copy(treeLoading = false) } }
+        }
+    }
+
+    /** 切换到一个已存在的 session:重建上下文,清空当前聊天区。 */
+    fun openSession(sessionId: String) {
+        val machine = connection.activeMachine ?: return
+        closeDrawer()
+        viewModelScope.launch {
+            runCatching {
+                opencodeClient.openSessionContext(machine, sessionId, SecretaryPrompt.SYSTEM_PROMPT)
+            }.onSuccess { ctx ->
+                sessionContext.loadMessages(emptyList())
+                opencodeSessionId = sessionId
+                _uiState.value = ChatUiState(sessionId = sessionId)
+            }.onFailure { e ->
+                addError("打开 session 失败: ${e.message}")
+            }
+        }
+    }
+
+    /** 在当前机器新建一个 session(默认进入当前项目目录)。 */
+    fun newSession() {
+        val machine = connection.activeMachine ?: return
+        closeDrawer()
+        viewModelScope.launch {
+            runCatching { opencodeClient.createSession(machine.baseUrl) }
+                .onSuccess { session ->
+                    opencodeSessionId = session.id
+                    sessionContext.clear()
+                    _uiState.value = ChatUiState(sessionId = session.id)
+                    refreshSessionTree()
+                }
+                .onFailure { e -> addError("新建 session 失败: ${e.message}") }
+        }
+    }
+
     private fun parseInstruction(arguments: String): String? = try {
         val obj = Json.parseToJsonElement(arguments).jsonObject
         obj["instruction"]?.jsonPrimitive?.content
