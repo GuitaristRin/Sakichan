@@ -1,25 +1,23 @@
-# Rust build artifacts
-target/
+# Legacy reference code (desktop Rust + old mobile), removed after migration
+legacy/
 
-# IDE files
+# Android / Gradle build
+build/
+.gradle/
+local.properties
+*.iml
+.cxx/
+captures/
+
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS files
 .DS_Store
 Thumbs.db
 
-# Config files (user-specific)
+# User config / logs
 config.toml
-
-# Distribution packages
-Sakichan-Windows/
-Sakichan-Desktop/
-Sakichan-Desktop.zip
 *.log
-
-# Rust
-Cargo.lock
