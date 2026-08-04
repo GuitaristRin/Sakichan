@@ -10,7 +10,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `cargo test -p sakichan-core` — run core crate tests (all co-located inline in source files)
 - `cargo test -p sakichan-core -- <test_name>` — run a specific test by name
 - `cargo build -p sakichan-gtk` — build the GTK4 GUI binary only (requires gtk4 dev libs)
+- `cargo build --release` — release build (all crates, optimized)
 - `RUST_LOG=debug cargo run --bin sakichan-cli` — run CLI with debug logging (default level is `warn`)
+- GTK4 build dependency (Arch Linux): `sudo pacman -S gtk4`
 
 ## CLI Usage
 
@@ -29,6 +31,7 @@ sakichan-cli --session <ID> --prompt "你好"                         # Text cha
 sakichan-cli --session <ID> --prompt "这是什么" --image photo.png    # Image chat
 sakichan-cli --session <ID> --prompt "..." --file doc.txt            # File context
 sakichan-cli --session <ID> --prompt "..." --dsv4f TRUE              # Force DeepSeek
+sakichan-cli --session <ID> --prompt "..." --dsv4f TRUE --thinking TRUE    # DeepSeek with reasoning
 
 # Branching
 sakichan-cli --session <ID> --prompt "..." --deri 1 --order 2
@@ -127,6 +130,14 @@ with tokio::runtime::Runtime::spawn_blocking to call send_blocking from the GTK 
 
 - **Streaming output**: CLI uses `StreamingLine` (green, `\r` overwrite). GTK throttles markdown re-renders to 180ms; final render always on `Done`.
 - **Branching**: Messages stored with `(depth, order)` coordinates. Default new message: `max_depth + 1`, order `1`. `--deri` creates parallel branches at a given depth; collision check (bails if order already has messages at that depth).
+
+  ```
+  depth 0: [user] "你好" → [assistant] "你好！"
+           │
+  depth 1: ├─ order 1: [user] "今天天气如何？" → ...
+           ├─ order 2: [user] "你会做什么？"    → ... (--deri 1 --order 2)
+           └─ order 3: [user] "讲个笑话"       → ... (--deri 1 --order 3)
+  ```
 - **Conversation compression**: `--compressconv` reads the active branch messages, optionally prepends latest existing summary as reference context, calls the model, persists to `conversation_summaries`. Incremental: new summary references the previous one.
 - **Keychain**: API keys in OS keychain, referenced in config as `ENC_KEYRING:com.sakichan/<name>`. `resolve_keyring_value()` prompts stdin on first use and saves the key.
 - **Schema migration**: `initialize_tables()` uses `CREATE TABLE IF NOT EXISTS` followed by `PRAGMA table_info` → `ALTER TABLE ADD COLUMN` for backward-compatible additive migrations.
