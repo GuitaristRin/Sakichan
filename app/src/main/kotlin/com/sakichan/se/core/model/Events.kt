@@ -11,6 +11,7 @@ sealed interface StreamEvent {
 sealed interface PipelineEvent {
     data class Token(val text: String) : PipelineEvent
     data class ReasoningToken(val text: String) : PipelineEvent
+    data class ToolCallDelta(val index: Int, val id: String?, val name: String?, val argumentsChunk: String) : PipelineEvent
     data class MemoriesInjected(val count: Int) : PipelineEvent
     data object NoMemoriesFound : PipelineEvent
     data class AnalyseImage(val text: String) : PipelineEvent

@@ -85,6 +85,7 @@ dependencies {
     implementation(libs.koin.core)
     implementation(libs.koin.android)
     implementation(libs.koin.compose)
+    implementation(libs.koin.compose.viewmodel)
 
     // Serialization
     implementation(libs.kotlinx.serialization.json)

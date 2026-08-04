@@ -11,7 +11,7 @@ coroutines = "1.9.0"
 koin = "4.0.2"
 datastore = "1.1.3"
 securityCrypto = "1.1.0-alpha06"
-kotlinxSerializationJson = "1.7.3"
+kotlinxSerializationJson = "1.6.3"
 
 [libraries]
 # Compose
@@ -49,6 +49,7 @@ coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutin
 koin-core = { group = "io.insert-koin", name = "koin-core", version.ref = "koin" }
 koin-android = { group = "io.insert-koin", name = "koin-android", version.ref = "koin" }
 koin-compose = { group = "io.insert-koin", name = "koin-compose", version.ref = "koin" }
+koin-compose-viewmodel = { group = "io.insert-koin", name = "koin-compose-viewmodel", version.ref = "koin" }
 
 # Serialization
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }

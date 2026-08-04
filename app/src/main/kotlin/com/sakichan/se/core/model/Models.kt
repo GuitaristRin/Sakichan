@@ -13,7 +13,8 @@ data class FinalResult(
     val fullContent: String,
     val reasoningContent: String?,
     val usage: UsageInfo?,
-    val finishReason: String
+    val finishReason: String,
+    val toolCalls: List<ToolCall> = emptyList(),
 )
 
 data class UsageInfo(

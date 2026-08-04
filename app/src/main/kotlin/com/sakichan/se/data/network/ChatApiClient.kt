@@ -13,6 +13,13 @@ import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 
+/**
+ * 秘书 LLM 流式聊天客户端。经 SenseNova token 端点调用 DeepSeek V4 Flash。
+ *
+ * 支持 function calling:传 [tools] 后,流式 delta 里的 `tool_calls` 增量会被
+ * 归并,最终随 [FinalResult.toolCalls] 一次返回(同时逐段发 [PipelineEvent.ToolCallDelta]。
+ * 秘书用它产出 `run_opencode_task` 指令,ChatViewModel 据此调度 opencode server。
+ */
 class ChatApiClient(private val okHttpClient: OkHttpClient) {
 
     fun streamChat(
@@ -21,9 +28,10 @@ class ChatApiClient(private val okHttpClient: OkHttpClient) {
         modelId: String,
         messages: List<Message>,
         options: ChatOptions = ChatOptions(),
-        isDeepSeek: Boolean = false
+        isDeepSeek: Boolean = false,
+        tools: List<JsonObject> = emptyList(),
     ): Flow<PipelineEvent> = callbackFlow {
-        val bodyJson = buildRequestJson(modelId, messages, options, isDeepSeek)
+        val bodyJson = buildRequestJson(modelId, messages, options, isDeepSeek, tools)
         val bodyString = bodyJson.toString()
         val request = Request.Builder()
             .url(apiBase)
@@ -37,6 +45,8 @@ class ChatApiClient(private val okHttpClient: OkHttpClient) {
         var accumulatedReasoning: StringBuilder? = null
         var finishReason = "stop"
         var usage: UsageInfo? = null
+        // index -> 累积中的 tool call
+        val toolCallAccum = LinkedHashMap<Int, ToolCallAccum>()
 
         val listener = object : EventSourceListener() {
             override fun onEvent(
@@ -47,11 +57,13 @@ class ChatApiClient(private val okHttpClient: OkHttpClient) {
             ) {
                 Log.d("SSE", "data: $data")
                 if (data == "[DONE]") {
+                    val toolCalls = toolCallAccum.values.mapNotNull { it.build() }
                     trySend(PipelineEvent.Done(FinalResult(
                         fullContent = accumulatedContent.toString(),
                         reasoningContent = accumulatedReasoning?.toString(),
                         usage = usage,
-                        finishReason = finishReason
+                        finishReason = finishReason,
+                        toolCalls = toolCalls,
                     )))
                     return
                 }
@@ -76,6 +88,21 @@ class ChatApiClient(private val okHttpClient: OkHttpClient) {
                                 }
                                 accumulatedReasoning!!.append(token)
                                 trySend(PipelineEvent.ReasoningToken(token))
+                            }
+                        }
+
+                        // function calling 增量:delta.tool_calls[] 带 index,逐段拼接 arguments
+                        delta["tool_calls"]?.jsonArray?.forEach { tcElem ->
+                            val tc = tcElem.jsonObject
+                            val idx = tc["index"]?.jsonPrimitive?.intOrNull ?: 0
+                            val accum = toolCallAccum.getOrPut(idx) { ToolCallAccum() }
+                            tc["id"]?.jsonPrimitive?.contentOrNull?.let { accum.id = it }
+                            tc["function"]?.jsonObject?.let { fn ->
+                                fn["name"]?.jsonPrimitive?.contentOrNull?.let { accum.name = it }
+                                fn["arguments"]?.jsonPrimitive?.contentOrNull?.let { arg ->
+                                    accum.arguments.append(arg)
+                                    trySend(PipelineEvent.ToolCallDelta(idx, accum.id, accum.name, arg))
+                                }
                             }
                         }
 
@@ -127,13 +154,17 @@ class ChatApiClient(private val okHttpClient: OkHttpClient) {
         modelId: String,
         messages: List<Message>,
         options: ChatOptions,
-        isDeepSeek: Boolean
+        isDeepSeek: Boolean,
+        tools: List<JsonObject>,
     ): JsonObject = buildJsonObject {
         put("model", modelId)
         put("messages", JsonArray(messages.map { it.toApiValue() }))
         put("stream", true)
         if (!isDeepSeek) {
             putJsonObject("stream_options") { put("include_usage", true) }
+        }
+        if (tools.isNotEmpty()) {
+            put("tools", JsonArray(tools))
         }
         options.maxTokens?.let { put("max_tokens", it) }
         options.temperature?.let { put("temperature", it.toDouble()) }
@@ -143,5 +174,17 @@ class ChatApiClient(private val okHttpClient: OkHttpClient) {
                 put(entry.key, entry.value)
             }
         }
+    }
+}
+
+private class ToolCallAccum {
+    var id: String? = null
+    var name: String? = null
+    val arguments = StringBuilder()
+
+    fun build(): ToolCall? {
+        val id = id ?: return null
+        val name = name ?: return null
+        return ToolCall(id = id, type = "function", function = ToolFunction(name, arguments.toString()))
     }
 }
