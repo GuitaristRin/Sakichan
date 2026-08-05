@@ -91,14 +91,15 @@ class ChatApiClient(private val okHttpClient: OkHttpClient) {
                             }
                         }
 
-                        // function calling 增量:delta.tool_calls[] 带 index,逐段拼接 arguments
+                        // function calling 增量:delta.tool_calls[] 带 index,逐段拼接 arguments。
+                        // SenseNova 后续 chunk 的 id/name 是空字符串,不能覆盖首块的正确值。
                         delta["tool_calls"]?.jsonArray?.forEach { tcElem ->
                             val tc = tcElem.jsonObject
                             val idx = tc["index"]?.jsonPrimitive?.intOrNull ?: 0
                             val accum = toolCallAccum.getOrPut(idx) { ToolCallAccum() }
-                            tc["id"]?.jsonPrimitive?.contentOrNull?.let { accum.id = it }
+                            tc["id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { accum.id = it }
                             tc["function"]?.jsonObject?.let { fn ->
-                                fn["name"]?.jsonPrimitive?.contentOrNull?.let { accum.name = it }
+                                fn["name"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { accum.name = it }
                                 fn["arguments"]?.jsonPrimitive?.contentOrNull?.let { arg ->
                                     accum.arguments.append(arg)
                                     trySend(PipelineEvent.ToolCallDelta(idx, accum.id, accum.name, arg))
@@ -130,8 +131,9 @@ class ChatApiClient(private val okHttpClient: OkHttpClient) {
                 val msg = when {
                     t != null -> "Network error: ${t.message}"
                     response != null -> {
-                        val body = response.body?.string()?.take(300) ?: ""
-                        "HTTP ${response.code}" + if (body.isNotBlank()) ": $body" else ""
+                        val body = response.body?.string().orEmpty()
+                        Log.w("SSE", "HTTP ${response.code}: $body")
+                        "HTTP ${response.code}: ${body.take(500)}"
                     }
                     else -> "Unknown SSE error"
                 }
@@ -160,11 +162,10 @@ class ChatApiClient(private val okHttpClient: OkHttpClient) {
         put("model", modelId)
         put("messages", JsonArray(messages.map { it.toApiValue() }))
         put("stream", true)
-        if (!isDeepSeek) {
-            putJsonObject("stream_options") { put("include_usage", true) }
-        }
+        putJsonObject("stream_options") { put("include_usage", true) }
         if (tools.isNotEmpty()) {
             put("tools", JsonArray(tools))
+            put("tool_choice", "auto")
         }
         options.maxTokens?.let { put("max_tokens", it) }
         options.temperature?.let { put("temperature", it.toDouble()) }
@@ -183,8 +184,11 @@ private class ToolCallAccum {
     val arguments = StringBuilder()
 
     fun build(): ToolCall? {
-        val id = id ?: return null
-        val name = name ?: return null
-        return ToolCall(id = id, type = "function", function = ToolFunction(name, arguments.toString()))
+        val id = id?.takeIf { it.isNotBlank() } ?: return null
+        val name = name?.takeIf { it.isNotBlank() } ?: return null
+        val args = arguments.toString()
+        // SenseNova 校验 tool_call 的 name/arguments 非空;空参数视为未完整返回,丢弃
+        if (args.isBlank()) return null
+        return ToolCall(id = id, type = "function", function = ToolFunction(name, args))
     }
 }

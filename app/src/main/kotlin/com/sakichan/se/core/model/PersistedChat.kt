@@ -16,6 +16,7 @@ data class PersistedChatSession(
     val lastActiveAt: Long = 0L,
     val messages: List<Message> = emptyList(),
     val items: List<PersistedChatItem> = emptyList(),
+    val opencodeSessionId: String? = null,
 )
 
 /**

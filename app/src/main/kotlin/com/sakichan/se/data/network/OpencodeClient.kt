@@ -105,6 +105,32 @@ class OpencodeClient(
         return json.decodeFromString(OcProject.serializer(), resp.body!!.string())
     }
 
+    // ===== 只读文件 API(思考层 skill 用)=====
+
+    /** 列目录。GET /file?path=(path 用绝对路径,返回 JSON 数组:name/path/type)。 */
+    suspend fun listDirectory(baseUrl: String, path: String): String {
+        val resp = okHttpClient.newCall(
+            Request.Builder().url("${trimSlash(baseUrl)}/file?path=${urlEncode(path)}").get().build()
+        ).await()
+        return resp.body!!.string()
+    }
+
+    /** 读文件内容。GET /file/content?path=(只读文件,读目录会报错)。 */
+    suspend fun readFile(baseUrl: String, path: String): String {
+        val resp = okHttpClient.newCall(
+            Request.Builder().url("${trimSlash(baseUrl)}/file/content?path=${urlEncode(path)}").get().build()
+        ).await()
+        return resp.body!!.string()
+    }
+
+    /** 按文件名搜索(正则 query,非 glob)。GET /find/file?query=。 */
+    suspend fun findFiles(baseUrl: String, query: String): String {
+        val resp = okHttpClient.newCall(
+            Request.Builder().url("${trimSlash(baseUrl)}/find/file?query=${urlEncode(query)}&limit=50").get().build()
+        ).await()
+        return resp.body!!.string()
+    }
+
     /**
      * 异步发消息(不等待)。返回后立即订阅 [events] 拿流式结果。
      * 用 prompt_async 而非同步 message:后者会阻塞直到 agent 跑完,失去实时性。

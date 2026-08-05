@@ -1,9 +1,13 @@
 package com.sakichan.se
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -11,6 +15,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sakichan.se.connection.ConnectionManager
 import com.sakichan.se.ui.chat.ChatScreen
@@ -23,13 +28,28 @@ import org.koin.compose.koinInject
 import org.koin.compose.viewmodel.koinViewModel
 
 class MainActivity : ComponentActivity() {
+
+    private val notifPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* 结果无所谓:拒绝通知不影响任务执行,只是看不到完成提示 */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestNotificationPermission()
         enableEdgeToEdge()
         setContent {
             SakichanTheme {
                 AppRoot()
             }
+        }
+    }
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 }
@@ -76,7 +96,10 @@ private fun AppRoot() {
                 state = state,
                 onInputChange = vm::onInputChange,
                 onSend = vm::send,
+                onAbort = vm::abort,
                 onReplyPermission = vm::replyPermission,
+                onApproveProposal = vm::approveProposal,
+                onRejectProposal = vm::rejectProposal,
                 onOpenSettings = { screen = Screen.SETTINGS },
                 onDisconnect = {
                     vm.disconnect()

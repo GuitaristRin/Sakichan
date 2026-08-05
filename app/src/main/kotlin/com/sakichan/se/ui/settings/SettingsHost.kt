@@ -24,10 +24,9 @@ fun SettingsHost(onBack: () -> Unit) {
     SettingsScreen(
         state = state,
         onBack = onBack,
-        onSave = { apiKey, modelId ->
+        onSave = { apiKey, _ ->
             config.setApiKey(apiKey)
-            config.setModelId(modelId)
-            state = state.copy(apiKey = apiKey, modelId = modelId, statusText = "已保存")
+            state = state.copy(apiKey = apiKey, statusText = "已保存")
         },
     )
 }

@@ -84,27 +84,50 @@ BUILD.md 旧版写的是 `GET /api/session/:id/event` + `session.next.text.delta
 `step-finish` part 即完成 → 拼输出回灌秘书总结。旧文档的 per-session SSE 端点
 (`/api/session/:id/event`)与 `session.next.*` 事件在 1.18.11 实测不推送。
 
-## 4. 秘书 ↔ App 协议:function calling(已拍板)
+## 4. 秘书 ↔ App 协议:双层思考 agent(已重构)
 
-早期设想的 `[#task]`/`[#done]` 文本标记**已废弃**。改用 function calling(决策 #3):
+早期设想的 `[#task]`/`[#done]` 文本标记**已废弃**。改用 function calling。秘书分两层:
 
-- 秘书 system prompt 见 `SecretaryPrompt.kt`
-- 工具:`run_opencode_task`,参数 `{instruction: string}`
-- 秘书调工具 → `ChatViewModel` 拦截 → 建/复用 session → `prompt_async` 发指令 →
-  订阅事件流 → 权限回调 → `session.idle` 后把输出拼成 tool result 回灌秘书做总结
-- 总结轮不带 tools,强制输出文本(防无限派活)
+**思考层**(`ThinkingAgent.kt`,DSV4F 硬编码、默认不开 reasoning_effort):
+- 轻量自治 agent:思考 → 调只读 skill → 观察 → 再思考,循环直到终态
+- 只读 skill(复用 opencode 只读 API):`list_directory` / `read_file` / `search_files`
+- 终态工具:`ask_user`(要问用户)/ `start_task`(启动 opencode)/ `reply`(纯回复)
+- 思考过程**不展示**给用户,只展示终态消息
 
-## 5. Session 树(deri 映射)
+**表层**(`ChatViewModel`):
+- 用户可见的对话流,接收思考层终态
+- opencode 运作时显示底部状态条(`OcStatus`,带动画)
+- 用户在 oc 运行中可发消息问进度,思考层判断是汇报/继续等
+- 秘书可主动发消息(oc 完成 / 需权限 / 主动汇报)
 
-用户确认的架构:**「机器 id → 项目目录名 → session id」**。多机器分属不同管理,构成
-树状目录。
+**对话流程**:
+1. 用户下达初级想法 → 思考层理解 + 用 skill 收集上下文
+2. 信息不足 → `ask_user` → 表层展示问题,等用户回复 → 回第 1 步
+3. 已清楚 → `start_task` → 表层确认("好的,开始")→ 启动 opencode → 底部状态条
+4. oc 运作中用户可问"怎么样了" → 思考层基于当前状态汇报
+5. oc 完成 → 总结轮(`SUMMARY_PROMPT`,无工具)产出面向用户的总结
 
-- 机器:经 mDNS 扫描或手动输入,`Machine(id, baseUrl, name, host, port)`
-- 项目:opencode `/project` 返回,`OcProject(id, worktree=目录, name, vcs)`
-- session:opencode `/session`,按 `projectID` 归类到项目
-- 抽屉 UI:`SessionTreeDrawer`(MetroDrawer),机器名标题 → 项目目录(可折叠)→ sessions
+**思考层/总结轮均不带工具**(总结轮强制输出文本,防无限派活)。
 
-旧 Sakichan 的 `(depth, order)` 对话树已由 opencode session fork(`POST /fork`)覆盖。
+## 5. 会话架构:本地对话线程 与 opencode 工作 session 解耦
+
+用户确认的架构:**Sakichan 对话 session 和 opencode 工作 session 是两个独立的东西**。
+
+- **Sakichan 本地会话**(`sakichanSessionId`,本地 uuid):秘书层的对话线程(用户↔秘书的
+  聊天记忆),存在手机 DataStore。抽屉展示的是这些本地会话列表。
+- **opencode session**(`opencodeSessionId`):PC 上真正干活的 agent 会话(独立 id)。
+  **首次派活时才创建**(`ensureOpencodeSession` 懒创建),并绑定到当前本地会话。
+
+**秘书的角色**:理解用户意图 → "选/建/切哪个 opencode session"**本身是工具指令** →
+可主动创建、切换 session,或在不同 session 间跳。Sakichan 对话 session 只是秘书的记忆
+容器,不是 opencode 工作的绑定。用户在 PC 上跑到一半,手机选中同一个 opencode session
+即可续跑。
+
+**抽屉 = 本地会话列表**(`refreshSessionTree` 从 `ChatHistoryRepository` 读),
+不是 opencode 项目树。每个本地会话恢复其聊天 + 绑定的 opencode session id。
+
+持久化模型 `PersistedChatSession`: `sessionId`(本地 uuid) + `opencodeSessionId`(绑定的
+opencode session,可空)。
 
 ## 6. 技术栈
 
@@ -207,6 +230,7 @@ Sakichan/
 │       │   │   │   ├── PersistedChat.kt  # 本地持久化模型(聊天历史 + session 元数据)
 │       │   │   │   └── SessionTree.kt    # 机器-项目-session 树 + buildSessionTree()
 │       │   │   ├── session/SessionContext.kt
+│       │   │   ├── agent/ThinkingAgent.kt # 思考层:自驱循环 + 只读 skill + 终态工具
 │       │   │   └── util/                 # CjkUtils / Utils
 │       │   ├── data/
 │       │   │   ├── discovery/DiscoveryService.kt  # NsdManager 扫描

@@ -12,10 +12,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.BasicText
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
@@ -28,9 +30,12 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.takahashirinta.kanesumi.controls.MetroButton
@@ -53,7 +58,10 @@ fun ChatScreen(
     state: ChatUiState,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
+    onAbort: () -> Unit,
     onReplyPermission: (approve: Boolean, always: Boolean) -> Unit,
+    onApproveProposal: (ChatItem.Proposal) -> Unit,
+    onRejectProposal: (ChatItem.Proposal) -> Unit,
     onOpenSettings: () -> Unit,
     onDisconnect: () -> Unit,
     onOpenDrawer: () -> Unit,
@@ -87,13 +95,15 @@ fun ChatScreen(
                         onReply = onReplyPermission,
                     )
                 } else {
+                    val taskRunning = state.isLoading || state.ocStatus != null
                     MetroChatInputBar(
                         text = state.inputText,
                         onTextChange = onInputChange,
-                        onSend = onSend,
-                        enabled = !state.isLoading,
-                        sendIcon = Icons.AutoMirrored.Filled.Send,
-                        sendContentDescription = "发送",
+                        onSend = if (taskRunning) onAbort else onSend,
+                        // opencode 运作中仍可输入(问进度),思考/总结轮中禁用
+                        enabled = !state.isLoading || state.ocStatus != null,
+                        sendIcon = if (taskRunning) Icons.Filled.Close else Icons.AutoMirrored.Filled.Send,
+                        sendContentDescription = if (taskRunning) "停止" else "发送",
                         modifier = Modifier.imePadding(),
                     )
                 }
@@ -144,7 +154,27 @@ fun ChatScreen(
                     item { ConfigHint() }
                 }
 
-                items(state.items, key = { it.id }) { item -> ChatItemRow(item) }
+                item(key = "status-dots") {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        WorkDot(label = "Sakichan", active = state.isLoading)
+                        WorkDot(label = "opencode", active = state.ocStatus != null)
+                    }
+                }
+
+                items(state.items, key = { it.id }) { item ->
+                    ChatItemRow(item, onApproveProposal, onRejectProposal)
+                }
+
+                // opencode 运作状态条:作为列表底部元素,不遮挡输入栏,不干扰点击
+                state.ocStatus?.let { status ->
+                    item(key = "oc-status") { OcStatusBar(status) }
+                }
             }
         }
 
@@ -160,8 +190,69 @@ fun ChatScreen(
     }
 }
 
+/** opencode 运作状态条:底部固定,带脉冲动画,显示实时 delta。 */
 @Composable
-private fun ChatItemRow(item: ChatItem) {
+private fun OcStatusBar(status: OcStatus) {
+    val colors = LocalMetroColors.current
+    val typography = LocalMetroTypography.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(colors.primary.copy(alpha = 0.12f))
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        MetroProgressIndicator(sizeDp = 16.dp, strokeDp = 2.dp)
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            MetroText(
+                text = status.text,
+                color = colors.primary,
+                style = typography.caption,
+                maxLines = 1,
+            )
+            status.lastDelta?.let {
+                MetroText(
+                    text = it.take(60),
+                    color = colors.onSurfaceVariant,
+                    style = typography.caption,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+// 工作指示灯:亮绿=工作中,灰=空闲
+private val statusOn = Color(0xFF2ECC40)
+private val statusOff = Color(0x55333333)
+
+@Composable
+private fun WorkDot(label: String, active: Boolean) {
+    val colors = LocalMetroColors.current
+    val typography = LocalMetroTypography.current
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier
+                .size(10.dp)
+                .background(if (active) statusOn else statusOff, shape = CircleShape)
+                .semantics { contentDescription = if (active) "$label 工作中" else "$label 空闲" },
+        )
+        Spacer(Modifier.width(6.dp))
+        MetroText(
+            text = label,
+            color = if (active) colors.primary else colors.onSurfaceVariant,
+            style = typography.caption,
+        )
+    }
+}
+
+@Composable
+private fun ChatItemRow(
+    item: ChatItem,
+    onApproveProposal: (ChatItem.Proposal) -> Unit,
+    onRejectProposal: (ChatItem.Proposal) -> Unit,
+) {
     val colors = LocalMetroColors.current
     val typography = LocalMetroTypography.current
     when (item) {
@@ -185,18 +276,33 @@ private fun ChatItemRow(item: ChatItem) {
                 )
             }
             if (item.text.isNotBlank() || item.streaming) {
-                MetroText(
-                    text = item.text.ifBlank { if (item.streaming) "思考中…" else "" },
-                    color = colors.onSurface,
-                    style = typography.body,
-                )
-            }
-            if (item.streaming) {
-                Spacer(Modifier.padding(top = 6.dp))
-                MetroProgressIndicator(sizeDp = 18.dp, strokeDp = 2.dp)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(colors.surfaceVariant, shape = androidx.compose.foundation.shape.RoundedCornerShape(0.dp))
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                ) {
+                    if (item.text.isNotBlank()) {
+                        BasicText(
+                            text = renderMarkdown(item.text, colors.onSurface),
+                            style = typography.body.copy(color = colors.onSurface),
+                        )
+                    } else if (item.streaming) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            MetroProgressIndicator(sizeDp = 16.dp, strokeDp = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            MetroText(
+                                text = "正在输入…",
+                                color = colors.onSurfaceVariant,
+                                style = typography.caption,
+                            )
+                        }
+                    }
+                }
             }
         }
         is ChatItem.Task -> TaskRow(item)
+        is ChatItem.Proposal -> ProposalRow(item, onApproveProposal, onRejectProposal)
         is ChatItem.Error -> MessageBubble(
             text = item.text,
             bg = Color(0xFF3A1A1A),
@@ -272,6 +378,63 @@ private fun TaskRow(task: ChatItem.Task) {
         }
         if (task.status == TaskStatus.RUNNING || task.status == TaskStatus.TOOL) {
             MetroProgressIndicator(sizeDp = 16.dp, strokeDp = 2.dp)
+        }
+    }
+}
+
+@Composable
+private fun ProposalRow(
+    proposal: ChatItem.Proposal,
+    onApprove: (ChatItem.Proposal) -> Unit,
+    onReject: (ChatItem.Proposal) -> Unit,
+) {
+    val colors = LocalMetroColors.current
+    val typography = LocalMetroTypography.current
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .background(colors.surfaceVariant)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+    ) {
+        MetroText(
+            text = "执行计划",
+            color = colors.primary,
+            style = typography.bodyMedium,
+        )
+        if (proposal.plan.isNotBlank()) {
+            MetroText(
+                text = proposal.plan,
+                color = colors.onSurface,
+                style = typography.body,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        } else {
+            MetroText(
+                text = proposal.instruction,
+                color = colors.onSurfaceVariant,
+                style = typography.caption,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            MetroButton(
+                text = "批准执行",
+                onClick = { onApprove(proposal) },
+                modifier = Modifier.weight(1f),
+            )
+            MetroButton(
+                text = "先不要",
+                onClick = { onReject(proposal) },
+                modifier = Modifier.weight(1f),
+                containerColor = colors.surface,
+                contentColor = colors.onSurface,
+            )
         }
     }
 }

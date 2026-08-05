@@ -27,8 +27,14 @@ data class Message(
 
     fun toApiValue(): JsonObject = buildJsonObject {
         put("role", role)
+        val hasToolCalls = !toolCalls.isNullOrEmpty()
         if (images.isEmpty()) {
-            put("content", content)
+            // 带 tool_calls 的 assistant 消息:content 必须为 null(空字符串会被服务端 400)
+            if (hasToolCalls && content.isBlank()) {
+                put("content", JsonNull)
+            } else {
+                put("content", content)
+            }
         } else {
             put("content", buildJsonArray {
                 if (content.isNotBlank()) {

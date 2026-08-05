@@ -72,9 +72,8 @@ class ConnectionViewModel(
             try {
                 val health = opencode.health(machine.baseUrl)
                 val projects = opencode.listProjects(machine.baseUrl)
-                val directory = runCatching { opencode.currentProject(machine.baseUrl).worktree }.getOrNull()
-                    ?.takeIf { !it.isNullOrBlank() && it != "/" }
-                    ?: projects.firstOrNull { !it.worktree.isNullOrBlank() && it.worktree != "/" }?.worktree
+                // 当前工作目录 = 首个非根的有效项目 worktree;不再单独调 /project/current(省一次网络往返,减少失败面)
+                val directory = projects.firstOrNull { !it.worktree.isNullOrBlank() && it.worktree != "/" }?.worktree
                 val resolved = machine.copy(version = health.version)
                 connection.connect(resolved, projects, directory)
                 _uiState.update { it.copy(connecting = false) }

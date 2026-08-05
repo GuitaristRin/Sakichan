@@ -75,13 +75,11 @@ fun SettingsScreen(
                     singleLine = true,
                 )
                 Spacer(Modifier.height(16.dp))
-                SectionLabel("秘书模型 ID")
-                MetroTextField(
-                    value = modelId,
-                    onValueChange = { modelId = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = "deepseek-v4-flash",
-                    singleLine = true,
+                SectionLabel("秘书模型")
+                MetroText(
+                    text = "deepseek-v4-flash(硬编码)",
+                    color = colors.onSurfaceVariant,
+                    style = typography.body,
                 )
                 Spacer(Modifier.height(20.dp))
                 MetroButton(
